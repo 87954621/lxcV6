@@ -6,7 +6,7 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 当前版本：
 
-![](https://img.shields.io/badge/version-1.5.0-blue)
+![](https://img.shields.io/badge/version-1.6.0-blue)
 
  ｜ 更新：`kp update`
 
@@ -45,7 +45,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.5.0   ·   ONLY IPv6
+   ◆ kp 1.6.0   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐
@@ -105,7 +105,8 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp persist`      | 持久化，重启后仍保持 IPv6-only                      |
 | `kp persist off`  | 取消持久化                                     |
 | `kp nic`          | 查看探针是否上报 IPv4                             |
-| `kp nic off`      | 不上报 IPv4（面板不再显示本机 IPv4）                   |
+| `kp nic off`      | 不上报 IPv4（面板不再显示本机 IPv4）；默认排除法            |
+| `kp nic off --include` | 改用白名单：只统计纯 IPv6 网卡                      |
 | `kp nic on`       | 恢复默认，IPv4、IPv6 都上报                        |
 | `kp update`       | 检查更新（有新版会询问）                              |
 | `kp update check` | 只检查，不安装                                   |
@@ -150,17 +151,21 @@ kp restore     # 恢复 IPv4 出站
 **选菜单 7，或：**
 
 ```bash
-kp nic off      # 让探针忽略 IPv4，只上报 IPv6
+kp nic off              # 默认排除法：排除带 IPv4 的网卡（其余照常统计）
+kp nic off --include    # 改用白名单：只统计纯 IPv6 网卡
 ```
 
 脚本会自动判断你装的是哪种探针，走对应的改法：
 
-| 探针         | 关掉 IPv4 上报的做法                                                                                                                                                                                        |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Komari** | 两个参数**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=<有 IPv6 的网卡>`。systemd 写 drop-in；OpenRC 写 `/etc/conf.d/komari-agent`，若 init 脚本不 export 则**直接注入启动参数** |
-| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡                                                                                                                                   |
+| 探针 | 关掉 IPv4 上报的做法 |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Komari** | 两个参数**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + 网卡过滤。默认 `AGENT_EXCLUDE_NICS=<带 IPv4 的网卡>`（排除法）；加 `--include` 则用 `AGENT_INCLUDE_NICS=<只有 IPv6 的网卡>`。systemd 写 drop-in；OpenRC 写 `/etc/conf.d/komari-agent`，若 init 脚本不 export 则**直接注入启动参数** |
+| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡 |
 
 改完都会自动重启探针。
+
+> 为什么默认排除法：机器上常见"只有一张双栈网卡"的情况，纯 v6 网卡一张都挑不出来，
+> 白名单直接无解；排除法只要有一张带 v4 的网卡就能用。
 
 > 操作前会检查本机有没有全局 IPv6，没有就拒绝执行（否则可能彻底失联）。
 
@@ -182,7 +187,7 @@ Alpine / OpenRC 上，`/etc/conf.d/<svc>` 只是**变量仓库** —— 变量�
 
 1. 先查 `/etc/init.d/<svc>` 有没有 `export` / `set -a`
 2. **有** → 写 conf.d 就够了
-3. **没有** → 直接把 `--get-ip-addr-from-nic --include-nics eth1` 注入到 init 脚本的
+3. **没有** → 直接把 `--get-ip-addr-from-nic --exclude-nics eth0` 注入到 init 脚本的
    `command_args=` 行尾（带 `# kp-nic-args` 标记，便于 `kp nic on` 精确撤销）
 
 怎么确认是否生效：
@@ -198,7 +203,7 @@ tr '\0' '\n' < /proc/$(pgrep -f 'komari|agent' | head -1)/environ | grep -iE 'ni
 ### Komari 探针（重要）
 
 **Komari agent 默认压根不读网卡** —— 它是向 `api.ipify.org` 之类的外部 API 查**出口公网 IP**，
-查到什么报什么。所以**单设 `include_nics` 完全没用**，这是个很容易踩的坑。
+查到什么报什么。所以**单设网卡过滤完全没用**，这是个很容易踩的坑。
 
 官方 README 里没列、但源码里真实存在的关键参数（`cmd/flags/flag.go`）：
 
@@ -214,13 +219,25 @@ tr '\0' '\n' < /proc/$(pgrep -f 'komari|agent' | head -1)/environ | grep -iE 'ni
 
 ```
 if get_ip_addr_from_nic {            ← 默认 false，直接跳过
-    从 include_nics 白名单网卡取 IP     ← 这里才用到 include_nics
+    遍历网卡，按 include_nics / exclude_nics 过滤
     if 取到了 { 返回 }
 }
 从外部 API 查出口 IP                 ← 默认走这条
 ```
 
-所以正确的组合是**两个一起开**：
+所以正确的组合是**两个一起开**（两种过滤方式任选其一）：
+
+**方式 A：排除法（`kp nic off` 默认）**
+
+```ini
+[Service]
+Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
+Environment="AGENT_EXCLUDE_NICS=eth0"
+```
+
+把**带 IPv4 的网卡排除掉**，其余网卡照常统计。适合 `eth0` 双栈（v4+v6）、`eth1` 纯 v6 这类情况 —— 排掉 `eth0` 后 agent 只从 `eth1` 取 IPv6。
+
+**方式 B：白名单（`kp nic off --include`）**
 
 ```ini
 [Service]
@@ -228,8 +245,12 @@ Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
 Environment="AGENT_INCLUDE_NICS=eth1"
 ```
 
-`kp nic off` 会同时写这两行。原理：改成从网卡取 IP 后，只遍历白名单里的 `eth1`，
-而 `eth1` 上只有 IPv6 没有 IPv4 → IPv4 取到空值 → **上报空值 → 面板不再显示 IPv4**。
+只遍历白名单里的 `eth1`，要求 `eth1` 上**只有 IPv6、没有 IPv4**。
+
+两种方式的共同点：改成从网卡取 IP 后，取到的 IPv4 为空 → **上报空值 → 面板不再显示 IPv4**。
+
+> 为什么默认用排除法？因为机器上常见的情况是"只有一张双栈网卡"，
+> 这时一个纯 v6 网卡都挑不出来，白名单直接无解；排除法只要有一张带 v4 的网卡就能用。
 
 > ⚠️ 早前版本的本脚本写过 `IGNORE_IPV4`，**那个参数根本不存在**（我编的），
 > 所以那时怎么改都"没有效果"。现在已改为上面这组真实参数。
@@ -290,17 +311,22 @@ Komari 的配置优先级（低 → 高）：**默认值 → 命令行参数 →
 tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -iE 'nic|IP_ADDR'
 ```
 
-**两个变量都要看到**：`AGENT_GET_IP_ADDR_FROM_NIC=true` 和 `AGENT_INCLUDE_NICS=eth1`。
-少了前者，agent 就会继续走外部 API 查出口 IP，`include_nics` 等于空转。
+**两个变量都要看到**，且是对应的那一对：
 
-**4. 确认那张网卡真的没有 IPv4**
+- 排除法（默认）：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_EXCLUDE_NICS=eth0`
+- 白名单：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=eth1`
+
+少了前者，agent 就会继续走外部 API 查出口 IP，网卡过滤等于空转。
+
+**4. 确认过滤规则选对了**
 
 ```bash
-ip -br addr show eth1
+ip -br addr show eth0     # 带 IPv4 的网卡 → 应该出现在 EXCLUDE_NICS 里
+ip -br addr show eth1     # 纯 IPv6 的网卡 → 用白名单时才放 INCLUDE_NICS
 ```
 
-如果 `eth1` 上同时挂着 IPv4 和 IPv6，那 IPv4 照样会被取到并上报。
-这种情况下改用 `exclude_nics` 排除那张有 IPv4 的网卡（比如 `eth0`），而不是用白名单。
+如果用白名单，而那张网卡上同时挂着 IPv4 和 IPv6，IPv4 照样会被取到并上报 ——
+这时改用 `kp nic off`（排除法）把带 IPv4 的网卡排掉。
 
 **5. 面板上的 IPv4 可能来自连接来源 IP**
 
@@ -323,7 +349,8 @@ ip -br addr show eth1
 - 探针识别不准时用 `KP_PROBE=komari` 或 `KP_PROBE=nezha` 强制指定
 - 面板显示本机 IPv4 ≠ 出网没禁干净，那是探针上报的网卡地址，用 `kp nic off` 处理
 - 哪吒的 `nic_allowlist` 可能被面板下发的远程配置覆盖，面板能改就优先在面板改
-- `kp nic off` 只筛**网卡**不筛地址族：那张网卡上如果同时有 IPv4，IPv4 仍会被上报
+- `kp nic off` 只筛**网卡**不筛地址族：默认排除法会把带 IPv4 的网卡整张排掉，
+  所以留着的那几张网卡最好确实带 IPv6，否则会连 IPv6 都不上报
 - 上报是定时的（Komari 约 5 分钟 / 哪吒默认 30 分钟），改完不会立刻在面板上看到变化
 
 ---
