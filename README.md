@@ -2,7 +2,7 @@
 
 VPS 纯 IPv6 切换脚本，配合 Komari 探针使用。
 
-当前版本：[![](https://img.shields.io/badge/version-1.0.0-blue)](kp.sh) ｜ 更新：`kp update`
+当前版本：[![](https://img.shields.io/badge/version-1.0.3-blue)](kp.sh) ｜ 更新：`kp update`
 
 > 前置：机器已安装 Komari 探针。
 
