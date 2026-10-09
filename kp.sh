@@ -27,7 +27,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.4.0"
+VERSION="1.4.1"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -163,7 +163,20 @@ badge() { printf '%s %s %s' "$2" "$1" "$RST"; }
 
 OK="${BGRN}✔ OK${RST}"; FAIL="${BRED}✘ 失败${RST}"; WARN="${BYEL}▲ 注意${RST}"
 
-have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+# 判断本机能不能用 systemd 管服务。
+# 容器（incus / LXC）里 /run/systemd/system 常常不存在，但 systemctl 是可用的，
+# 所以不能只看那个目录 —— 三重判定：pid 1 是 systemd / 目录存在 / systemctl 真能用。
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -d /run/systemd/system ] && return 0
+  # 容器里 pid 1 也可能不是 systemd，但 systemctl 仍能通过 dbus 操作宿主的 systemd
+  if [ -r /proc/1/comm ] && grep -q '^systemd' /proc/1/comm 2>/dev/null; then
+    return 0
+  fi
+  # 最后手段：直接问 systemctl 能不能列出单元（能列出说明 systemd 真的可用）
+  systemctl list-units >/dev/null 2>&1 && return 0
+  return 1
+}
 
 # 探针服务名：Komari 用 AGENT（默认 komari-agent）；
 # 哪吒的单元名固定是 nezha-agent，不用靠 AGENT 猜。
@@ -908,8 +921,13 @@ has_v6() {
 }
 
 # 有全局 IPv6 的网卡名（Komari include_nics / 哪吒 nic_allowlist 共用）
+# 注意：容器里的 veth 会输出成 "eth1@if160" 这种带 @ 后缀的名字，
+# 那不是真网卡名，agent 匹配不上 → 必须用 ${x%%@*} 把后缀切掉。
 v6_nics() {
-  ip -br -6 addr show scope global 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' '
+  ip -br -6 addr show scope global 2>/dev/null \
+    | awk '{print $1}' \
+    | sed 's/@.*//' \
+    | sort -u | tr '\n' ' '
 }
 
 # 逗号分隔的形态（Komari include_nics 用）
@@ -930,12 +948,19 @@ nic_now() {
   fi
   for f in "$NICDROP" "$NICENVF" /etc/conf.d/$AGENT /etc/sysconfig/$AGENT; do
     [ -f "$f" ] || continue
-    v=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*AGENT_(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(AGENT_)?PREFER_IP_VERSION[ =]+[^ "'"'"']+)|(--prefer-ip-version[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
-    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    # 必须同时看到「从网卡取 IP」开关，否则 include_nics 是空转（agent 不读网卡）
+    nics=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*AGENT_(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
+    [ -z "$nics" ] && continue
+    if grep -qE '(--get-ip-addr-from-nic)|(^[[:space:]]*AGENT_GET_IP_ADDR_FROM_NIC[ =]+(true|1|yes))' "$f" 2>/dev/null; then
+      printf '%s（从网卡取 IP 已开启）' "$nics"
+    else
+      printf '%s（缺 get_ip_addr_from_nic，未生效）' "$nics"
+    fi
+    return 0
   done
   # 从进程命令行里现场读
   ps ax 2>/dev/null | grep -v grep \
-    | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--prefer-ip-version[= ][46])' | head -1
+    | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--get-ip-addr-from-nic)' | tr '\n' ' ' | sed 's/ $//'
 }
 
 # ── 哪吒：改 YAML 的 nic_allowlist ──────────────────────
@@ -1059,7 +1084,13 @@ cmd_nic() {
   case "$ACT" in
     show|list)
       echo
-      dim "面板上的 IPv4 来自 agent 上报的地址列表，不是出口 IP"
+      dim "面板上的 IPv4 来自 agent 上报，可能是出口 IP，也可能是网卡地址"
+      if [ "$KIND" = "nezha" ]; then
+        dim "哪吒：只监控指定网卡（nic_allowlist）"
+      else
+        dim "Komari：需同时开「从网卡取 IP」+ 网卡白名单，缺一不可"
+        dim "  AGENT_GET_IP_ADDR_FROM_NIC=true + AGENT_INCLUDE_NICS=<有v6的网卡>"
+      fi
       dim "想让它不上报 IPv4：kp nic off"
       dim "想恢复默认（两者都报）：kp nic on"
       return 0 ;;
@@ -1103,9 +1134,11 @@ cmd_nic() {
     return 0
   fi
 
-  # ── Komari：走 include_nics 分支 ──
-  # 官方参数：include_nics / AGENT_INCLUDE_NICS / --include-nics（逗号分隔）
-  # 只统计有 IPv6 的网卡 → 内网 IPv4 不进上报列表。
+  # ── Komari：走 include_nics + get_ip_addr_from_nic 分支 ──
+  # 关键：agent 默认是从外部 API 查「出口公网 IP」上报的（看源码 monitoring/unit/ip.go
+  # GetIPAddress()），根本不读网卡 —— 所以单设 include_nics 没用。
+  # 必须先打开 AGENT_GET_IP_ADDR_FROM_NIC=true 切到「从网卡取 IP」这条路，
+  # include_nics 才生效：只遍历白名单网卡，eth1 上没有 IPv4 → 上报空值 → 面板无 IPv4。
   NICS_CSV="$(v6_nics_csv)"
   if [ -z "$NICS_CSV" ]; then
     res "没有发现带公网 IPv6 的网卡" "$RED"
@@ -1118,12 +1151,14 @@ cmd_nic() {
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
       mkdir -p "$(dirname "$NICDROP")" 2>/dev/null
       cat > "$NICDROP" <<EOF
-# kp: 只统计有 IPv6 的网卡，内网 IPv4 不再上报
+# kp: 让 agent 改从网卡取 IP，且只取有 IPv6 的网卡 → 不上报 IPv4
 [Service]
+Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
 Environment="AGENT_INCLUDE_NICS=$NICS_CSV"
 EOF
       kvp "写入 drop-in" "$NICDROP"
       kvp "仅统计网卡" "$NICS_CSV"
+      dim "AGENT_GET_IP_ADDR_FROM_NIC=true"
       dim "AGENT_INCLUDE_NICS=$NICS_CSV"
     else
       if [ -f "$NICDROP" ]; then
@@ -1133,8 +1168,8 @@ EOF
       else
         kvp "drop-in" "本来就没有"
       fi
-      if [ -f "$NICENVF" ] && grep -qE '^(AGENT_)?(INCLUDE|EXCLUDE)_NICS=' "$NICENVF" 2>/dev/null; then
-        grep -vE '^(AGENT_)?(INCLUDE|EXCLUDE)_NICS=' "$NICENVF" > "$NICENVF.tmp" \
+      if [ -f "$NICENVF" ] && grep -qE '^(AGENT_)?(INCLUDE|EXCLUDE|GET_IP_ADDR_FROM)_?(NICS|NIC)=' "$NICENVF" 2>/dev/null; then
+        grep -vE '^(AGENT_)?(INCLUDE|EXCLUDE|GET_IP_ADDR_FROM)_?(NICS|NIC)=' "$NICENVF" > "$NICENVF.tmp" \
           && mv "$NICENVF.tmp" "$NICENVF"
         kvp "清理 env 文件" "$NICENVF"
       fi
@@ -1146,17 +1181,18 @@ EOF
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
       if [ -f "$CF" ]; then
         cp -a "$CF" "$CF.bak.$(date +%s)" 2>/dev/null
-        grep -vE '^(AGENT_)?INCLUDE_NICS=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
+        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
       else
         printf '# kp\n' > "$CF"
       fi
+      printf 'AGENT_GET_IP_ADDR_FROM_NIC=true\n' >> "$CF"
       printf 'AGENT_INCLUDE_NICS=%s\n' "$NICS_CSV" >> "$CF"
       kvp "写入 conf.d" "$CF"
       kvp "仅统计网卡" "$NICS_CSV"
       dim "还需确认 /etc/init.d/$AGENT 会把 conf.d 变量导出给进程"
     else
-      if [ -f "$CF" ] && grep -qE '^(AGENT_)?INCLUDE_NICS=' "$CF" 2>/dev/null; then
-        grep -vE '^(AGENT_)?INCLUDE_NICS=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+      if [ -f "$CF" ] && grep -qE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" 2>/dev/null; then
+        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
         kvp "移除 conf.d 配置" "已清理"
       else
         kvp "conf.d 配置" "本来就没有"
@@ -1165,7 +1201,7 @@ EOF
   else
     res "没有 systemd 或 OpenRC" "$YEL"
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
-      dim "手工在启动命令里加：--include-nics $NICS_CSV"
+      dim "手工在启动命令里加：--get-ip-addr-from-nic --include-nics $NICS_CSV"
       return 1
     fi
     dim "无需处理（本来就没配置过滤）"
@@ -1196,9 +1232,10 @@ EOF
                  || res "  仍有残留：$N2" "$YEL"
   fi
   echo
-  dim "参数名以 agent 版本为准，先确认：$AGENT --help | grep -i nics"
-  dim "若你的版本用其他写法，直接改 $NICDROP"
-  dim "面板不会立刻刷新：agent 基础信息默认每 5 分钟上报一次"
+  dim "生效要点：agent 已改为「从网卡取 IP」，只遍历白名单网卡"
+  dim "那张网卡上没有 IPv4 → 上报空值 → 面板不再显示 IPv4"
+  dim "面板不会立刻刷新：基础信息默认每 ${INFO_MIN:-5} 分钟上报一次"
+  dim "验证：tr '\\0' '\\n' < /proc/\$(pgrep -f $AGENT | head -1)/environ | grep -iE 'nic|IP_ADDR'"
 }
 
 # ── 检查更新 ────────────────────────────────────────────

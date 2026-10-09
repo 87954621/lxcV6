@@ -6,7 +6,7 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 当前版本：
 
-![](https://img.shields.io/badge/version-1.4.0-blue)
+![](https://img.shields.io/badge/version-1.4.1-blue)
 
  ｜ 更新：`kp update`
 
@@ -155,12 +155,10 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 
 脚本会自动判断你装的是哪种探针，走对应的改法：
 
-| 探针         | 关掉 IPv4 上报的做法                                                                                                                                               |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Komari** | 为 `komari-agent` 写 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设 `AGENT_INCLUDE_NICS=eth1`；OpenRC 系统写 `/etc/conf.d/komari-agent` |
-| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡                                                                                         |
-
-两者思路一样：**只统计有公网 IPv6 的网卡**，内网 IPv4 自然就不进上报列表了。
+| 探针         | 关掉 IPv4 上报的做法                                                                                                                                                                                        |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Komari** | 两个环境变量**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=<有 IPv6 的网卡>`，写进 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`）；OpenRC 写 `/etc/conf.d/komari-agent` |
+| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡                                                                                                                                   |
 
 改完都会自动重启探针。
 
@@ -172,23 +170,44 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 kp nic on       # Komari 删掉 drop-in；哪吒删掉 nic_allowlist 段。两者都重新上报
 ```
 
-> 参数名以探针版本为准，建议先确认：`komari-agent --help | grep -i nics`。
+### Komari 探针（重要）
 
-### Komari 探针
+**Komari agent 默认压根不读网卡** —— 它是向 `api.ipify.org` 之类的外部 API 查**出口公网 IP**，
+查到什么报什么。所以**单设 `include_nics` 完全没用**，这是个很容易踩的坑。
 
-Komari agent 用 `include_nics` 指定**仅统计哪些网卡**（逗号分隔），对应三种等价写法：
+官方 README 里没列、但源码里真实存在的关键参数（`cmd/flags/flag.go`）：
 
-| JSON 字段        | 环境变量                 | 命令行参数            |
-| -------------- | -------------------- | ---------------- |
-| `include_nics` | `AGENT_INCLUDE_NICS` | `--include-nics` |
+| JSON 字段                    | 环境变量                            | 说明                    |
+| ------------------------- | ------------------------------- | --------------------- |
+| `get_ip_addr_from_nic`    | `AGENT_GET_IP_ADDR_FROM_NIC`    | **从网卡获取 IP**（默认 `false`） |
+| `custom_ipv4`             | `AGENT_CUSTOM_IPV4`             | 自定义 IPv4 地址           |
+| `custom_ipv6`             | `AGENT_CUSTOM_IPV6`             | 自定义 IPv6 地址           |
+| `include_nics`            | `AGENT_INCLUDE_NICS`            | 仅统计指定网卡，逗号分隔          |
+| `exclude_nics`            | `AGENT_EXCLUDE_NICS`            | 排除指定网卡，逗号分隔           |
 
-反向的还有 `exclude_nics` / `AGENT_EXCLUDE_NICS` / `--exclude-nics`（排除指定网卡）。
+源码逻辑（`monitoring/unit/ip.go` 的 `GetIPAddress()`）：
 
-`kp nic off` 会自动列出本机有公网 IPv6 的网卡，写成 `AGENT_INCLUDE_NICS=eth1` 放进 drop-in。
+```
+if get_ip_addr_from_nic {            ← 默认 false，直接跳过
+    从 include_nics 白名单网卡取 IP     ← 这里才用到 include_nics
+    if 取到了 { 返回 }
+}
+从外部 API 查出口 IP                 ← 默认走这条
+```
 
-> ⚠️ **官方没有 `IGNORE_IPV4` 这类"忽略地址族"的参数**（早前版本的本脚本写过这个，是错的）。  
-> 只有网卡白名单这一条路。另有一个 `--prefer-ip-version`（`4` 或 `6`），  
-> 影响的是**出站连接**优先用哪个版本，不是上报内容，与本需求无关。
+所以正确的组合是**两个一起开**：
+
+```ini
+[Service]
+Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
+Environment="AGENT_INCLUDE_NICS=eth1"
+```
+
+`kp nic off` 会同时写这两行。原理：改成从网卡取 IP 后，只遍历白名单里的 `eth1`，
+而 `eth1` 上只有 IPv6 没有 IPv4 → IPv4 取到空值 → **上报空值 → 面板不再显示 IPv4**。
+
+> ⚠️ 早前版本的本脚本写过 `IGNORE_IPV4`，**那个参数根本不存在**（我编的），
+> 所以那时怎么改都"没有效果"。现在已改为上面这组真实参数。
 
 ### 哪吒（Nezha）探针
 
@@ -243,10 +262,11 @@ drop-in 写了不代表生效 —— 如果原始 service 里有 `Environment=AG
 Komari 的配置优先级（低 → 高）：**默认值 → 命令行参数 → 环境变量 → JSON 配置文件**。
 
 ```bash
-tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -i nics
+tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -iE 'nic|IP_ADDR'
 ```
 
-有输出且不是你要的那张网卡，说明被别处覆盖了 —— 去改那个更高优先级的来源。
+**两个变量都要看到**：`AGENT_GET_IP_ADDR_FROM_NIC=true` 和 `AGENT_INCLUDE_NICS=eth1`。
+少了前者，agent 就会继续走外部 API 查出口 IP，`include_nics` 等于空转。
 
 **4. 确认那张网卡真的没有 IPv4**
 
@@ -254,7 +274,8 @@ tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -i nics
 ip -br addr show eth1
 ```
 
-`include_nics` 只筛**网卡**，不筛地址族。如果 `eth1` 上同时挂着 IPv4 和 IPv6，那 IPv4 照样会被上报。
+如果 `eth1` 上同时挂着 IPv4 和 IPv6，那 IPv4 照样会被取到并上报。
+这种情况下改用 `exclude_nics` 排除那张有 IPv4 的网卡（比如 `eth0`），而不是用白名单。
 
 **5. 面板上的 IPv4 可能来自连接来源 IP**
 
