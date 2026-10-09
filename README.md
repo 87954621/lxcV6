@@ -33,21 +33,29 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 直接敲 `kp` 进入菜单，按数字选：
 
 ```
-════════ kp · 纯 IPv6 切换 ════════
+  ┌────────────────────────────────┐
+  │  kp · 纯 IPv6 切换工具         │
+  └────────────────────────────────┘
 
-  1  查看当前状态
-  2  探测能否纯 IPv6（自动还原）
-  3  切换到 IPv6-only
-  4  恢复 IPv4 出站
-  5  修复 DNS（IPv6 + IPv4 可选）
-  6  重启探针
-  7  禁止 IPv4 出站（iptables）
-  8  撤除封堵
-  0  退出
+  探针  komari-agent      ● 运行中
+  IPv4  10.10.3.66/22     ● 出网已切断
+  IPv6  2600:70ff:b8a0:0… ● 出网正常
+
+   1   查看当前状态
+   2   探测能否纯 IPv6（自动还原）
+   3   切换到 IPv6-only
+   4   恢复 IPv4 出站
+   5   修复 DNS（IPv6 + IPv4 可选）
+   6   重启探针
+   7   禁止 IPv4 出站（iptables）
+   8   撤除封堵
+   0   退出
 
   第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
   想切回来：选 4 恢复 IPv4 出站
 ```
+
+顶部三行是实时状态，不用进菜单就能看到探针和出网情况。
 
 危险操作（3、7）会先问一次 `y/N` 再执行。
 
@@ -69,17 +77,20 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 ### 典型流程
 
 ```bash
-PANEL=你的面板域名 kp check   # 探测，看完结论再决定
+PANEL=你的面板域名 kp check   # 先探测，看完结论再决定
 kp keep                      # 切到 IPv6-only
-kp fix                       # 重启探针，让它走 IPv6
+kp fix                       # 修 DNS（菜单里选 IPv6 优先那档）
+kp restart                   # 重启探针，让它走 IPv6
 ```
+
+> 改完 DNS 必须重启探针，多数 agent 只在启动时解析一次域名。
 
 ### 常用
 
 ```bash
-kp status                           # 随时看状态
-systemctl restart komari-agent      # systemd 重启探针
-rc-service komari-agent restart     # Alpine 重启探针
+kp status      # 看状态
+kp restart     # 重启探针（自动识别 systemd / OpenRC）
+kp restore     # 恢复 IPv4 出站
 ```
 
 ---
@@ -89,6 +100,8 @@ rc-service komari-agent restart     # Alpine 重启探针
 - 动手前确认有服务商的 VNC / 控制台，并确保 `ssh -6` 能连进来
 - `kp block` 需要 `NET_ADMIN` 权限，容器里没有的话用 `kp keep`
 - 脚本改的是运行时状态，重启失效；要持久化在 `/etc/dhcpcd.conf` 加 `nogateway`
+- DNS 最多生效 3 个 nameserver（glibc MAXNS），所以 `kp fix` 只写 3 个
+- 服务名不同时用 `KP_AGENT=实际服务名 kp restart`；内网网段不同时用 `KP_LAN=x.x.x.x/x`
 
 ---
 
