@@ -100,6 +100,35 @@ net_dev() {
 # 删除默认路由前把网关记下来，供恢复时使用
 GWFILE="/tmp/.kp-ipv4-gw"
 
+# 从 DHCP 租约文件里翻出网关
+lease_gw() {
+  for f in /var/lib/dhcp/dhclient.*.leases /var/lib/dhcpcd/*.lease \
+           /var/db/dhclient.leases.* /tmp/dhcpcd*.lease; do
+    [ -f "$f" ] || continue
+    g=$(grep -h -oE '(option[ _]routers?|ROUTERS?)[= ]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$f" 2>/dev/null \
+        | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    [ -n "$g" ] && { printf '%s' "$g"; return 0; }
+  done
+  printf ''
+}
+
+# 按子网推测网关（网关通常是网段第一个地址）
+guess_gw() {
+  dev="$1"
+  line=$(ip -br -4 addr show scope global dev "$dev" 2>/dev/null | awk '{print $3; exit}')
+  [ -z "$line" ] && { printf ''; return 0; }
+  a=${line%%/*}; p=${line##*/}
+  IFS=. read -r o1 o2 o3 o4 <<EOF
+$a
+EOF
+  [ -z "${o4:-}" ] && { printf ''; return 0; }
+  ipn=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+  mask=$(( (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF ))
+  net=$(( ipn & mask ))
+  g=$(( net + 1 ))
+  printf '%d.%d.%d.%d' $(( (g >> 24) & 255 )) $(( (g >> 16) & 255 )) $(( (g >> 8) & 255 )) $(( g & 255 ))
+}
+
 ask() {
   printf '  %s%s%s [y/N]: ' "$YEL" "$1" "$RST"
   read -r a || return 1
@@ -233,27 +262,58 @@ cmd_restore() {
       read -r SGW SDEV < "$GWFILE" || true
       SDEV="${SDEV:-$D}"
     fi
-    if [ -z "$SGW" ]; then
-      dim "没记录到原网关，请输入（不知道就回车，脚本会尝试 DHCP）"
-      printf '  IPv4 网关: '
-      read -r SGW || true
-      SDEV="$D"
-    fi
-    if [ -n "$SGW" ] && [ -n "$SDEV" ]; then
-      if ip route add default via "$SGW" dev "$SDEV" 2>/dev/null; then
-        printf '  %-22s%s\n' "默认路由" "已恢复 via $SGW dev $SDEV"
-      else
-        printf '  %-22s%s\n' "默认路由" "$FAIL"
-        dim "手动执行：ip route add default via $SGW dev $SDEV"
+    SDEV="${SDEV:-$D}"
+
+    # 候选网关：记录 → DHCP 租约文件 → 子网 .1 → 手工输入
+    CANDS="$SGW"
+    LG=$(lease_gw); [ -n "$LG" ] && CANDS="$CANDS $LG"
+    GG=$(guess_gw "$D"); [ -n "$GG" ] && CANDS="$CANDS $GG"
+
+    FOUND=no
+    for gw in $CANDS; do
+      [ -z "$gw" ] && continue
+      ip route add default via "$gw" dev "$SDEV" 2>/dev/null || continue
+      if timeout 3 ping -4 -c 1 -W 2 "$gw" >/dev/null 2>&1; then
+        printf '  %-22s%s\n' "默认路由" "已恢复 via $gw dev $SDEV"
+        dim "来源：$( [ "$gw" = "$SGW" ] && echo 上次记录 || { [ "$gw" = "$LG" ] && echo DHCP租约 || echo 子网推测; } )"
+        FOUND=yes
+        break
       fi
-    else
-      printf '  %-22s%s\n' "默认路由" "转为 DHCP 获取"
-      if command -v dhcpcd >/dev/null 2>&1; then
-        dhcpcd -n "$D" 2>/dev/null || dhcpcd "$D" 2>/dev/null
+      ip route del default via "$gw" dev "$SDEV" 2>/dev/null
+      dim "试过 $gw，网关无响应，已撤销"
+    done
+
+    if [ "$FOUND" = "no" ]; then
+      printf '  %-22s' "默认路由"
+      res "未能自动确定" "$YEL"
+      dim "请直接回车跳过，或输入正确网关："
+      printf '  IPv4 网关: '
+      read -r UGW || true
+      if [ -n "$UGW" ]; then
+        if ip route add default via "$UGW" dev "$SDEV" 2>/dev/null; then
+          printf '  %-22s%s\n' "默认路由" "已恢复 via $UGW dev $SDEV"
+          FOUND=yes
+        else
+          printf '  %-22s%s\n' "默认路由" "$FAIL"
+        fi
+      fi
+    fi
+
+    if [ "$FOUND" = "no" ]; then
+      printf '  %-22s%s\n' "默认路由" "尝试重新 DHCP"
+      if command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i "$SDEV" -q -n -s /etc/udhcpc/default.script 2>/dev/null \
+          || udhcpc -i "$SDEV" -q -n 2>/dev/null
+      elif command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -n "$SDEV" 2>/dev/null || dhcpcd "$SDEV" 2>/dev/null
       elif command -v dhclient >/dev/null 2>&1; then
-        dhclient -r "$D" 2>/dev/null; dhclient "$D" 2>/dev/null
+        dhclient -r "$SDEV" 2>/dev/null; dhclient "$SDEV" 2>/dev/null
+      elif have_systemd; then
+        systemctl restart systemd-networkd 2>/dev/null || systemctl restart networking 2>/dev/null
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service networking restart 2>/dev/null
       else
-        dim "没有 dhcpcd / dhclient，需手动加默认路由"
+        dim "没有可用 DHCP 客户端"
       fi
       sleep 3
       [ -n "$(ip -4 route show default 2>/dev/null)" ] \
