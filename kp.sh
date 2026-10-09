@@ -147,7 +147,7 @@ GW=""; DEV=""; BAK="/tmp/.kp-resolv.bak.$$"; KEEP=no; DONE=no
 finish() {
   [ "$DONE" = "yes" ] && return 0
   DONE=yes
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   echo
   if [ "$KEEP" = "yes" ]; then
     hr "已保持 IPv6-only"
@@ -175,7 +175,9 @@ finish() {
 
 cmd_check() {
   KEEP="$1"
-  trap finish EXIT INT TERM
+  # HUP 必须捕获：中途关闭 SSH 时 shell 收到的是 SIGHUP，
+  # 漏掉它会导致 IPv4 默认路由来不及还原，机器卡在 IPv6-only
+  trap finish EXIT INT TERM HUP
 
   GW=$(ipv4_gw); DEV=$(ipv4_dev)
   backup_resolv
@@ -528,6 +530,62 @@ cmd_unblock() {
   printf '  %-22s%s\n' "封堵规则" "已清除"
 }
 
+# ── 持久化 ──────────────────────────────────────────────
+DHCPCCD="/etc/dhcpcd.conf"
+
+cmd_persist() {
+  ACT="${1:-on}"
+  hr "持久化设置"
+
+  if [ ! -f "$DHCPCCD" ]; then
+    printf '  %-22s%s\n' "dhcpcd.conf" "不存在，跳过"
+  elif [ "$ACT" = "off" ]; then
+    if grep -qE '^[[:space:]]*nogateway' "$DHCPCCD" 2>/dev/null; then
+      cp -a "$DHCPCCD" "$DHCPCCD.bak.$(date +%s)"
+      grep -vE '^[[:space:]]*nogateway' "$DHCPCCD" > "$DHCPCCD.tmp" 2>/dev/null \
+        && mv "$DHCPCCD.tmp" "$DHCPCCD"
+      printf '  %-22s%s\n' "dhcpcd nogateway" "已移除"
+    else
+      printf '  %-22s%s\n' "dhcpcd nogateway" "本来就没有"
+    fi
+  else
+    if grep -qE '^[[:space:]]*nogateway' "$DHCPCCD" 2>/dev/null; then
+      printf '  %-22s%s\n' "dhcpcd nogateway" "已存在"
+    else
+      printf '\n# kp: 不让 dhcpcd 安装 IPv4 默认网关\nnogateway\n' >> "$DHCPCCD"
+      printf '  %-22s%s\n' "dhcpcd nogateway" "已写入"
+      dim "续约时不会再恢复 IPv4 默认路由"
+    fi
+  fi
+
+  if [ -f /etc/resolv.conf.head ]; then
+    printf '  %-22s%s\n' "resolv.conf.head" "已存在"
+  else
+    cat > /etc/resolv.conf.head <<EOF
+nameserver $D1
+nameserver $D2
+EOF
+    printf '  %-22s%s\n' "resolv.conf.head" "已写入"
+  fi
+  dim "DNS：dhcpcd 重写 resolv.conf 时会把 head 放最前，IPv6 DNS 优先"
+
+  if command -v iptables >/dev/null 2>&1 && iptables -L OUTPUT -n >/dev/null 2>&1; then
+    if iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable 2>/dev/null; then
+      printf '  %-22s%s\n' "iptables 规则" "需手动保存"
+      note "Debian : netfilter-persistent save"
+      note "Alpine : iptables-save > /etc/iptables/rules-save"
+    fi
+  fi
+
+  echo
+  if [ "$ACT" = "off" ]; then
+    dim "取消后重启 dhcpcd 会重新装回 IPv4 默认路由"
+  else
+    dim "生效：rc-service dhcpcd restart   或   重启机器"
+    dim "取消：kp persist off"
+  fi
+}
+
 # ── 状态 ────────────────────────────────────────────────
 cmd_status() {
   hr "IPv4"
@@ -655,12 +713,14 @@ cmd_menu() {
     item "6" "重启探针"
     item "7" "禁止 IPv4 出站（iptables）"
     item "8" "撤除封堵"
+    item "9" "持久化（重启后仍保持）"
     item "0" "退出"
     echo
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
     dim "想切回来：选 4 恢复 IPv4 出站"
+    dim "防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9"
     echo
-    printf '  %s请选择 [0-8]: %s' "$CYN" "$RST"
+    printf '  %s请选择 [0-9]: %s' "$CYN" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -684,6 +744,7 @@ cmd_menu() {
         fi
         pause ;;
       8) cmd_unblock; pause ;;
+      9) cmd_persist on; pause ;;
       0) echo; exit 0 ;;
       *) echo "  无效选项"; pause ;;
     esac
@@ -702,6 +763,8 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp restart      重启探针
   kp block        iptables 硬性禁止 IPv4 出站
   kp unblock      撤除封堵
+  kp persist      持久化，重启后仍保持 IPv6-only
+  kp persist off  取消持久化
   kp status       查看当前网络状态
   kp help         帮助
 
@@ -721,6 +784,7 @@ case "${1:-}" in
   restart)   cmd_restart ;;
   block)     cmd_block ;;
   unblock)   cmd_unblock ;;
+  persist)   cmd_persist "${2:-on}" ;;
   status)    cmd_status ;;
   help|-h|--help) usage ;;
   *) echo "未知子命令: $1"; echo; usage; exit 1 ;;
