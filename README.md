@@ -35,18 +35,21 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 ```
 ════════ kp · 纯 IPv6 切换 ════════
 
-  1) 查看当前状态
-  2) 探测能否纯 IPv6（自动还原，安全）
-  3) 切换到 IPv6-only
-  4) 修复 DNS 并重启探针
-  5) 禁止 IPv4 出站（iptables）
-  6) 撤除封堵
-  0) 退出
+  1  查看当前状态
+  2  探测能否纯 IPv6（自动还原）
+  3  切换到 IPv6-only
+  4  恢复 IPv4 出站
+  5  修复 DNS（IPv6 + IPv4 可选）
+  6  重启探针
+  7  禁止 IPv4 出站（iptables）
+  8  撤除封堵
+  0  退出
 
-  提示：第一次用建议先选 1 看状态，再选 2 探测
+  第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
+  想切回来：选 4 恢复 IPv4 出站
 ```
 
-危险操作（3、5）会先问一次 `y/N` 再执行。
+危险操作（3、7）会先问一次 `y/N` 再执行。
 
 也支持非交互调用：
 
@@ -55,9 +58,11 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp` | 交互式菜单（默认） |
 | `kp check` | 探测能否纯 IPv6 存活，结束自动还原（最安全） |
 | `kp keep` | 探测后不还原，直接切到 IPv6-only |
-| `kp fix` | 换成 IPv6 DNS 并重启探针 |
+| `kp restore` | 恢复 IPv4 出站（切回来的路） |
+| `kp fix` | 修复 DNS（可选 `v6only` / `mixed` / `v4first`） |
 | `kp block` | iptables 硬性禁止 IPv4 出站 |
 | `kp unblock` | 撤除封堵 |
+| `kp restart` | 重启探针 |
 | `kp status` | 查看当前网络状态 |
 | `kp help` | 帮助 |
 

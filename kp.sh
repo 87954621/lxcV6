@@ -26,9 +26,11 @@ LAN="10.10.0.0/22"
 AGENT="komari-agent"
 [ -n "${KP_AGENT:-}" ] && AGENT="$KP_AGENT"   # 可用 KP_AGENT=xxx 覆盖服务名
 [ -n "${KP_LAN:-}" ] && LAN="$KP_LAN"         # 可用 KP_LAN=x.x.x.x/x 覆盖内网网段
-D1="2606:4700:4700::1111"
+D1="2606:4700:4700::1111"     # IPv6 DNS · Cloudflare
 D2="2606:4700:4700::1001"
-D3="2001:4860:4860::8888"
+D3="2001:4860:4860::8888"     # IPv6 DNS · Google
+V4A="1.1.1.1"                 # IPv4 DNS · Cloudflare（备用）
+V4B="8.8.8.8"                 # IPv4 DNS · Google（备用）
 TEST_URL="https://ifconfig.co"
 
 # ── 颜色 ────────────────────────────────────────────────
@@ -51,19 +53,52 @@ OK="${GRN}OK${RST}"; FAIL="${RED}失败${RST}"; WARN="${YEL}注意${RST}"
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
-write_dns6() {
-  cat > /etc/resolv.conf <<EOF
+# 注意 glibc 最多只用前 3 个 nameserver（MAXNS=3），写多了会被忽略。
+# 顺序很重要：解析器从第 1 个开始问，超时才换下一个，
+# 所以把能用的那个放前面，避免每次解析都干等超时。
+write_dns() {
+  case "${1:-mixed}" in
+    v6only)
+      cat > /etc/resolv.conf <<EOF
 nameserver $D1
 nameserver $D2
 nameserver $D3
 options timeout:2 attempts:2
 EOF
+      ;;
+    v4first)
+      cat > /etc/resolv.conf <<EOF
+nameserver $V4A
+nameserver $V4B
+nameserver $D1
+options timeout:2 attempts:1
+EOF
+      ;;
+    mixed|*)
+      cat > /etc/resolv.conf <<EOF
+nameserver $D1
+nameserver $D2
+nameserver $V4A
+options timeout:2 attempts:1
+EOF
+      ;;
+  esac
 }
 
 backup_resolv() { cp -a /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%s)" 2>/dev/null; }
 
 ipv4_gw()  { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'; }
 ipv4_dev() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+
+# 默认路由被删后仍能拿到网卡名：退而求其次从地址里取
+net_dev() {
+  d=$(ipv4_dev)
+  [ -z "$d" ] && d=$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $1; exit}')
+  printf '%s' "$d"
+}
+
+# 删除默认路由前把网关记下来，供恢复时使用
+GWFILE="/tmp/.kp-ipv4-gw"
 
 ask() {
   printf '  %s%s%s [y/N]: ' "$YEL" "$1" "$RST"
@@ -125,12 +160,13 @@ cmd_check() {
   printf '  %-22s%s\n' "当前 DNS" "$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf)"
 
   hr "临时切断 IPv4 出网"
+  [ -n "$GW" ] && [ -n "$DEV" ] && printf '%s %s\n' "$GW" "$DEV" > "$GWFILE"
   if [ -n "$DEV" ] && ip route del default dev "$DEV" 2>/dev/null; then
     printf '  %-22s%s\n' "删除默认路由" "$OK（地址保留）"
   else
     printf '  %-22s%s\n' "删除默认路由" "$DIM跳过$RST"
   fi
-  write_dns6
+  write_dns v6only
   printf '  %-22s%s\n' "切换 IPv6 DNS" "$OK"
 
   hr "验证"
@@ -169,13 +205,124 @@ cmd_check() {
   finish
 }
 
+# ── 恢复 IPv4 出站 ──────────────────────────────────────
+cmd_restore() {
+  hr "恢复 IPv4 出站"
+  D=$(net_dev)
+
+  # 1. 撤掉 iptables 封堵
+  if command -v iptables >/dev/null 2>&1 && iptables -L OUTPUT -n >/dev/null 2>&1; then
+    if iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable 2>/dev/null; then
+      ipt_del OUTPUT -j REJECT --reject-with icmp-net-unreachable
+      ipt_del OUTPUT -p udp -m multiport --dports 67,68 -j ACCEPT
+      ipt_del OUTPUT -d "$LAN" -j ACCEPT
+      ipt_del OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      ipt_del OUTPUT -o lo -j ACCEPT
+      printf '  %-22s%s\n' "iptables 封堵" "已撤除"
+    else
+      printf '  %-22s%s\n' "iptables 封堵" "本来就没有"
+    fi
+  fi
+
+  # 2. 恢复 IPv4 默认路由
+  if [ -n "$(ip -4 route show default 2>/dev/null)" ]; then
+    printf '  %-22s%s\n' "默认路由" "已存在，无需恢复"
+  else
+    SGW=""; SDEV=""
+    if [ -f "$GWFILE" ]; then
+      read -r SGW SDEV < "$GWFILE" || true
+      SDEV="${SDEV:-$D}"
+    fi
+    if [ -z "$SGW" ]; then
+      dim "没记录到原网关，请输入（不知道就回车，脚本会尝试 DHCP）"
+      printf '  IPv4 网关: '
+      read -r SGW || true
+      SDEV="$D"
+    fi
+    if [ -n "$SGW" ] && [ -n "$SDEV" ]; then
+      if ip route add default via "$SGW" dev "$SDEV" 2>/dev/null; then
+        printf '  %-22s%s\n' "默认路由" "已恢复 via $SGW dev $SDEV"
+      else
+        printf '  %-22s%s\n' "默认路由" "$FAIL"
+        dim "手动执行：ip route add default via $SGW dev $SDEV"
+      fi
+    else
+      printf '  %-22s%s\n' "默认路由" "转为 DHCP 获取"
+      if command -v dhcpcd >/dev/null 2>&1; then
+        dhcpcd -n "$D" 2>/dev/null || dhcpcd "$D" 2>/dev/null
+      elif command -v dhclient >/dev/null 2>&1; then
+        dhclient -r "$D" 2>/dev/null; dhclient "$D" 2>/dev/null
+      else
+        dim "没有 dhcpcd / dhclient，需手动加默认路由"
+      fi
+      sleep 3
+      [ -n "$(ip -4 route show default 2>/dev/null)" ] \
+        && printf '  %-22s%s\n' "默认路由" "已通过 DHCP 恢复" \
+        || printf '  %-22s%s\n' "默认路由" "$FAIL"
+    fi
+  fi
+
+  # 3. 还原 DNS
+  RB=$(ls -t /etc/resolv.conf.bak.* 2>/dev/null | head -1)
+  if [ -n "$RB" ]; then
+    cp -a "$RB" /etc/resolv.conf && printf '  %-22s%s\n' "DNS" "已从备份还原"
+    dim "$RB"
+  else
+    printf '  %-22s%s\n' "DNS" "没有备份，保持现状"
+  fi
+
+  # 4. 验证
+  hr "验证"
+  printf '  %-22s' "IPv4 出网"
+  V4=$(curl -4 -m 5 -s "$TEST_URL" 2>/dev/null)
+  [ -n "$V4" ] && res "$V4" "$GRN" || res "仍不可达" "$RED"
+  printf '  %-22s' "IPv6 出网"
+  V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
+  [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
+}
+
 # ── 修复 DNS ────────────────────────────────────────────
 cmd_fix() {
+  MODE="${1:-}"
+
+  if [ -z "$MODE" ] && [ -t 0 ]; then
+    hr "选择 DNS 组合"
+    note "IPv6 DNS 也能解析 IPv4 地址，只是查询报文走 IPv6 链路"
+    echo
+    item "1" "IPv6 优先 + IPv4 备用（推荐）"
+    item "2" "仅 IPv6（纯 IPv6 机器）"
+    item "3" "IPv4 优先 + IPv6 备用"
+    echo
+    printf '  请选择 [1-3]: '
+    read -r m || m=""
+    case "$m" in
+      2) MODE="v6only" ;;
+      3) MODE="v4first" ;;
+      *) MODE="mixed" ;;
+    esac
+  fi
+  [ -z "$MODE" ] && MODE="mixed"
+
   hr "修复 DNS"
   backup_resolv && dim "已备份原 resolv.conf"
-  write_dns6
-  printf '  %-22s%s\n' "写入 IPv6 DNS" "$OK"
-  dim "$D1 / $D2 / $D3"
+  case "$MODE" in
+    v6only)
+      write_dns v6only
+      printf '  %-22s%s\n' "模式" "仅 IPv6"
+      dim "$D1 / $D2 / $D3"
+      ;;
+    v4first)
+      write_dns v4first
+      printf '  %-22s%s\n' "模式" "IPv4 优先 + IPv6 备用"
+      dim "$V4A / $V4B / $D1"
+      ;;
+    *)
+      write_dns mixed
+      printf '  %-22s%s\n' "模式" "IPv6 优先 + IPv4 备用"
+      dim "$D1 / $D2 / $V4A"
+      ;;
+  esac
+  printf '  %-22s%s\n' "写入" "$OK"
 
   cat > /etc/resolv.conf.head <<EOF
 nameserver $D1
@@ -184,14 +331,21 @@ EOF
   printf '  %-22s%s\n' "持久化" "$OK"
   dim "已写 /etc/resolv.conf.head，dhcpcd 重写时保持 IPv6 优先"
 
+  hr "当前 resolv.conf"
+  awk '/^nameserver|^options/{print "  " $0}' /etc/resolv.conf
+
   hr "验证"
   printf '  %-22s' "域名解析"
   getent ahosts ifconfig.co >/dev/null 2>&1 && res "OK" "$GRN" || res "失败" "$RED"
   printf '  %-22s' "IPv6 出网"
   V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
+  printf '  %-22s' "IPv4 出网"
+  V4=$(curl -4 -m 5 -s "$TEST_URL" 2>/dev/null)
+  [ -n "$V4" ] && res "$V4" "$GRN" || res "不可达" "$YEL"
 
   dim "改完 DNS 记得重启探针才会重连"
+  dim "最多生效 3 个 nameserver（glibc MAXNS），多的会被忽略"
 }
 
 # ── 重启探针 ────────────────────────────────────────────
@@ -211,6 +365,7 @@ cmd_restart() {
     printf '  %-22s' "运行状态"
     systemctl is-active "$AGENT" >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
     dim "看日志：journalctl -u $AGENT -f"
+    return 0
 
   elif command -v rc-service >/dev/null 2>&1; then
     if rc-service "$AGENT" restart 2>/dev/null; then
@@ -224,6 +379,7 @@ cmd_restart() {
     printf '  %-22s' "运行状态"
     rc-service "$AGENT" status >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
     dim "看日志：tail -f /var/log/$AGENT.log"
+    return 0
 
   else
     printf '  %-22s%s\n' "服务管理器" "$FAIL"
@@ -365,23 +521,86 @@ banner() {
   printf '%s%s\n' "  └────────────────────────────────┘" "$RST"
 }
 
+# ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
+probe_state() {
+  if have_systemd; then
+    systemctl is-active "$AGENT" >/dev/null 2>&1 && { printf 'run'; return; }
+    systemctl list-unit-files "$AGENT.service" >/dev/null 2>&1 && { printf 'stop'; return; }
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "$AGENT" status >/dev/null 2>&1 && { printf 'run'; return; }
+    [ -f "/etc/init.d/$AGENT" ] && { printf 'stop'; return; }
+  fi
+  ps ax 2>/dev/null | grep -v grep | grep -q "$AGENT" && { printf 'run'; return; }
+  printf 'none'
+}
+
+v4_state() {
+  if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+    printf 'off'
+  elif command -v iptables >/dev/null 2>&1 \
+       && iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable >/dev/null 2>&1; then
+    printf 'blocked'
+  else
+    printf 'on'
+  fi
+}
+
+v6_state() {
+  [ -n "$(ip -6 route show default 2>/dev/null)" ] && printf 'on' || printf 'off'
+}
+
+menu_status() {
+  printf '  %s  ' "探针"
+  case "$(probe_state)" in
+    run)  printf '%-18s' "$AGENT"; res "● 运行中" "$GRN" ;;
+    stop) printf '%-18s' "$AGENT"; res "● 已停止" "$RED" ;;
+    *)    printf '%-18s' "-"; res "● 未安装" "$GRA" ;;
+  esac
+
+  A4=$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}')
+  [ -z "$A4" ] && A4="n/a"
+  printf '  %s  ' "IPv4"
+  printf '%-18s' "$A4"
+  case "$(v4_state)" in
+    on)      res "● 出网正常" "$GRN" ;;
+    off)     res "● 出网已切断" "$YEL" ;;
+    blocked) res "● 已封堵" "$YEL" ;;
+  esac
+
+  A6=$(ip -br -6 addr show scope global 2>/dev/null | awk '{print $3; exit}')
+  A6=${A6%%/*}
+  [ -z "$A6" ] && A6="n/a"
+  [ ${#A6} -gt 17 ] && A6="$(printf '%s' "$A6" | cut -c1-16)…"
+  printf '  %s  ' "IPv6"
+  printf '%-18s' "$A6"
+  case "$(v6_state)" in
+    on)  res "● 出网正常" "$GRN" ;;
+    off) res "● 出网不可用" "$RED" ;;
+  esac
+}
+
 cmd_menu() {
   while :; do
     clear 2>/dev/null || true
     banner
     echo
+    menu_status
+    echo
     item "1" "查看当前状态"
     item "2" "探测能否纯 IPv6（自动还原）"
     item "3" "切换到 IPv6-only"
-    item "4" "修复 DNS（换成 IPv6 DNS）"
-    item "5" "重启探针"
-    item "6" "禁止 IPv4 出站（iptables）"
-    item "7" "撤除封堵"
+    item "4" "恢复 IPv4 出站"
+    item "5" "修复 DNS（IPv6 + IPv4 可选）"
+    item "6" "重启探针"
+    item "7" "禁止 IPv4 出站（iptables）"
+    item "8" "撤除封堵"
     item "0" "退出"
     echo
-    dim "第一次用建议：先 1 看状态，再 2 探测，确认没问题后 3 切换"
+    dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
+    dim "想切回来：选 4 恢复 IPv4 出站"
     echo
-    printf '  %s请选择 [0-7]: %s' "$CYN" "$RST"
+    printf '  %s请选择 [0-8]: %s' "$CYN" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -394,16 +613,17 @@ cmd_menu() {
           echo "  已取消"
         fi
         pause ;;
-      4) cmd_fix; pause ;;
-      5) cmd_restart; pause ;;
-      6)
+      4) cmd_restore; pause ;;
+      5) cmd_fix; pause ;;
+      6) cmd_restart; pause ;;
+      7)
         if ask "确认禁止 IPv4 出站？内网 $LAN 与 SSH 会保留"; then
           cmd_block
         else
           echo "  已取消"
         fi
         pause ;;
-      7) cmd_unblock; pause ;;
+      8) cmd_unblock; pause ;;
       0) echo; exit 0 ;;
       *) echo "  无效选项"; pause ;;
     esac
@@ -417,7 +637,8 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp              交互式菜单（默认）
   kp check        探测能否纯 IPv6 存活，结束自动还原
   kp keep         探测后不还原，直接切到 IPv6-only
-  kp fix          换成 IPv6 DNS
+  kp restore      恢复 IPv4 出站
+  kp fix          修复 DNS（可选 v6only / mixed / v4first，不带参数则交互选择）
   kp restart      重启探针
   kp block        iptables 硬性禁止 IPv4 出站
   kp unblock      撤除封堵
@@ -435,6 +656,7 @@ case "${1:-}" in
   menu)      cmd_menu ;;
   check)     cmd_check no ;;
   keep)      cmd_check yes ;;
+  restore|unkeep) cmd_restore ;;
   fix)       cmd_fix ;;
   restart)   cmd_restart ;;
   block)     cmd_block ;;
