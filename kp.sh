@@ -6,8 +6,10 @@
 # 也支持非交互调用：
 #   kp check     探测能否纯 IPv6 存活，结束自动还原（最安全）
 #   kp keep      探测后不还原，直接切到 IPv6-only
+#   kp restore   恢复 IPv4 出站
 #   kp fix       换成 IPv6 DNS
 #   kp restart   重启探针
+#   kp nic off   让 agent 不上报 IPv4（面板不再显示本机 IPv4）
 #   kp block     iptables 硬性禁止 IPv4 出站
 #   kp unblock   撤除封堵
 #   kp status    查看当前网络状态
@@ -22,7 +24,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.0.0"
+VERSION="1.2.0"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -50,6 +52,7 @@ fi
 
 # ── 输出小工具 ──────────────────────────────────────────
 hr()    { printf '\n%s%s──── %s ────%s\n' "$BOLD" "$CYN" "$*" "$RST"; }
+hrt()   { printf '\n%s%s──── %s ────%s %sv%s%s\n' "$BOLD" "$CYN" "$*" "$RST" "$GRA" "$VERSION" "$RST"; }
 note()  { printf '  %s\n' "$*"; }
 dim()   { printf '  %s%s%s\n' "$GRA" "$*" "$RST"; }
 item()  { printf '   %s%s%s   %s\n' "$CYN$BOLD" "$1" "$RST" "$2"; }
@@ -606,227 +609,23 @@ EOF
   fi
 }
 
-# ── 锁定面板走 IPv6 ─────────────────────────────────────
+# ── 清理旧版 lockv6 残留（v1.1 已移除该功能）────────────
+# 早期版本往 /etc/hosts 写过 "# kp-panel" 标记，这里顺手清掉，
+# 避免老用户升级后仍被那条静态映射困住。
 HOSTS="/etc/hosts"
-MARK="# kp-panel"
+OLDMARK="# kp-panel"
 
-hosts_domain() {
-  awk -v m="$MARK" '$0 ~ m {print $2; exit}' "$HOSTS" 2>/dev/null
-}
-
-# 取面板域名：参数 → 已有标记 → 从探针服务里解析 → 询问
-panel_domain() {
-  if [ -n "${1:-}" ]; then printf '%s' "$1"; return 0; fi
-  [ -n "${PANEL:-}" ] && { printf '%s' "$PANEL"; return 0; }
-
-  d=$(hosts_domain)
-  [ -n "$d" ] && { printf '%s' "$d"; return 0; }
-
-  # 从 service 单元的 ExecStart / command_args 里抠 -e 后面的地址
-  for f in /etc/systemd/system/$AGENT.service /etc/init.d/$AGENT; do
-    [ -f "$f" ] || continue
-    u=$(grep -oE '(-e|--endpoint)[= ]+(https?://)?[^ "'"'"'\\]+' "$f" 2>/dev/null \
-        | head -1 | sed -E 's/^(-e|--endpoint)[= ]+//; s#^https?://##; s#/.*$##')
-    [ -n "$u" ] && { printf '%s' "$u"; return 0; }
-  done
-
-  if [ -t 0 ]; then
-    printf '  面板域名（从探针配置里没找到）: ' >&2
-    read -r u || true
-    printf '%s' "$u"
-  fi
-}
-
-cmd_lockv6() {
-  hr "锁定域名走 IPv6"
-  D=$(panel_domain "${1:-}")
-  if [ -z "$D" ]; then
-    res "拿不到域名" "$RED"
-    dim "用法：kp lockv6 域名"
-    dim "或先设置：PANEL=域名 kp lockv6"
-    dim "多个域名用逗号分隔：kp lockv6 a.com,b.com"
-    return 1
-  fi
-
-  OKN=0; FAILN=0
-  OLDIFS="$IFS"; IFS=','
-  for dom in $D; do
-    IFS="$OLDIFS"
-    dom=$(printf '%s' "$dom" | tr -d ' ')
-    [ -z "$dom" ] && continue
-    lock_one "$dom" && OKN=$((OKN + 1)) || FAILN=$((FAILN + 1))
-    IFS=','
-  done
-  IFS="$OLDIFS"
-
-  echo
-  hr "重启探针"
-  if restart_agent; then
-    printf '  %-22s%s\n' "$AGENT" "已重启"
-  else
-    dim "没能自动重启，请手动执行：rc-service $AGENT restart"
-  fi
-
-  hr "验证"
-  for dom in $(hosts_domains); do
-    printf '  %-22s' "$dom"
-    RN=$(getent ahosts "$dom" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-    if echo "$RN" | grep -q ':'; then
-      if echo "$RN" | grep -qE '(^| )[0-9]+\.'; then
-        res "$RN" "$YEL"; dim "仍返回 IPv4，探针可能还会尝试走它"
-      else
-        res "$RN" "$GRN"
-      fi
-    else
-      res "${RN:-解析失败}" "$RED"
-    fi
-  done
-
-  echo
-  printf '  %-22s%d 个成功' "结果" "$OKN"
-  [ "$FAILN" -gt 0 ] && res "，$FAILN 个失败" "$RED" || echo
-  dim "查看/管理：kp lockv6 list"
-  dim "撤销全部：kp lockv6 off"
-}
-
-lock_one() {
-  dom="$1"
-  printf '  %-22s%s\n' "域名" "$dom"
-
-  A6=$(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}' | grep ':' | head -1)
-  if [ -z "$A6" ]; then
-    res "  没有 AAAA 记录，跳过" "$RED"
-    return 1
-  fi
-  printf '  %-22s%s\n' "  IPv6" "$A6"
-  A4=$(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1; exit}')
-  [ -n "$A4" ] && printf '  %-22s%s\n' "  IPv4（将屏蔽）" "$A4"
-
-  if [ ! -f "$HOSTS" ]; then
-    res "  /etc/hosts 不存在" "$RED"
-    return 1
-  fi
-
+clean_old_lockv6() {
+  [ -f "$HOSTS" ] || return 0
+  grep -q "$OLDMARK" "$HOSTS" 2>/dev/null || return 0
   cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
-  # 只删这个域名的旧记录，其他域名保留
-  if awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {found=1} END{exit !found}' "$HOSTS"; then
-    awk -v m="$MARK" -v d="$dom" '!($0 ~ m && $2 == d)' "$HOSTS" > "$HOSTS.tmp" \
-      && mv "$HOSTS.tmp" "$HOSTS"
-  fi
-  printf '%s %s %s\n' "$A6" "$dom" "$MARK" >> "$HOSTS"
-  printf '  %-22s%s\n' "  写入 hosts" "$OK"
-  return 0
-}
-
-hosts_domains() {
-  awk -v m="$MARK" '$0 ~ m {print $2}' "$HOSTS" 2>/dev/null
-}
-
-cmd_lockv6_list() {
-  hr "已锁定的域名"
-  DS=$(hosts_domains)
-  if [ -z "$DS" ]; then
-    dim "没有锁定任何域名"
-    dim "添加：kp lockv6 域名"
-    return 0
-  fi
-  for dom in $DS; do
-    A=$(awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {print $1; exit}' "$HOSTS")
-    printf '  %-34s %s\n' "$dom" "$A"
-  done
-  echo
-  dim "移除某个：kp lockv6 rm 域名"
-  dim "全部移除：kp lockv6 off"
-}
-
-cmd_lockv6_rm() {
-  dom="${1:-}"
-  if [ -z "$dom" ]; then
-    res "请指定域名：kp lockv6 rm 域名" "$RED"
-    return 1
-  fi
-  hr "移除 $dom"
-  if ! hosts_domains | grep -qx "$dom"; then
-    dim "该域名不在锁定列表里"
-    return 0
-  fi
-  cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
-  awk -v m="$MARK" -v d="$dom" '!($0 ~ m && $2 == d)' "$HOSTS" > "$HOSTS.tmp" \
-    && mv "$HOSTS.tmp" "$HOSTS"
-  printf '  %-22s%s\n' "已移除" "$OK"
-  restart_agent 2>/dev/null && dim "已重启 $AGENT"
-}
-
-cmd_lockv6_off() {
-  hr "取消面板锁定"
-  if [ ! -f "$HOSTS" ]; then
-    dim "/etc/hosts 不存在"
-    return 0
-  fi
-  if grep -q "$MARK" "$HOSTS" 2>/dev/null; then
-    cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
-    grep -v "$MARK" "$HOSTS" > "$HOSTS.tmp" && mv "$HOSTS.tmp" "$HOSTS"
-    printf '  %-22s%s\n' "已移除 kp 记录" "$OK"
+  if grep -v "$OLDMARK" "$HOSTS" > "$HOSTS.tmp" 2>/dev/null; then
+    mv "$HOSTS.tmp" "$HOSTS"
+    printf '  %-22s%s\n' "旧 hosts 锁定" "已清理（并备份）"
     restart_agent 2>/dev/null && dim "已重启 $AGENT"
   else
-    printf '  %-22s%s\n' "k p 记录" "本来就没有"
+    rm -f "$HOSTS.tmp"
   fi
-}
-
-# 域名锁定的二级菜单
-cmd_lockv6_menu() {
-  while :; do
-    hr "锁定域名走 IPv6"
-    DS=$(hosts_domains)
-    if [ -n "$DS" ]; then
-      echo "  已锁定："
-      for dom in $DS; do
-        A=$(awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {print $1; exit}' "$HOSTS")
-        printf '    %s%-30s%s %s\n' "$GRN" "$dom" "$RST" "$A"
-      done
-    else
-      dim "当前没有锁定任何域名"
-    fi
-    echo
-    item "1" "添加域名"
-    item "2" "移除域名"
-    item "3" "全部移除"
-    item "0" "返回"
-    echo
-    printf '  %s请选择 [0-3]: %s' "$CYN" "$RST"
-    read -r m || return 0
-    case "$m" in
-      1)
-        DEF=$(panel_domain "")
-        printf '  域名'
-        [ -n "$DEF" ] && printf ' %s[%s]%s' "$GRA" "$DEF" "$RST"
-        printf '（多个用逗号分隔）: '
-        read -r in || in=""
-        [ -z "$in" ] && in="$DEF"
-        if [ -z "$in" ]; then
-          echo "  没有输入域名"
-        elif ask "写入 /etc/hosts 并重启探针？"; then
-          cmd_lockv6 "$in"
-        else
-          echo "  已取消"
-        fi
-        pause ;;
-      2)
-        printf '  要移除的域名: '
-        read -r rm || rm=""
-        cmd_lockv6_rm "$rm"
-        pause ;;
-      3)
-        if ask "移除全部锁定？"; then
-          cmd_lockv6_off
-        else
-          echo "  已取消"
-        fi
-        pause ;;
-      0) return 0 ;;
-      *) echo "  无效选项" ;;
-    esac
-  done
 }
 
 # ── 状态 ────────────────────────────────────────────────
@@ -864,25 +663,171 @@ cmd_status() {
   fi
 
   hr "面板"
-  HD=$(hosts_domain)
-  if [ -n "$HD" ]; then
-    HA=$(awk -v m="$MARK" '$0 ~ m {print $1; exit}' "$HOSTS" 2>/dev/null)
-    printf '  %-22s%s\n' "$HD" "已锁定到 $HA"
-    dim "撤销：kp lockv6 off"
+  printf '  %-22s%s\n' "本机 IPv4 地址" "$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' | grep . || echo 无)"
+  if [ -n "$(nic_now)" ]; then
+    printf '  %-22s%s\n' "IPv4 上报" "已屏蔽（面板不会显示上表地址）"
   else
-    printf '  %-22s%s\n' "未锁定" "探针按系统解析结果选路"
+    printf '  %-22s%s\n' "IPv4 上报" "开启（面板会显示上表地址）"
+    dim "想隐藏：kp nic off"
   fi
 
   hr "探针"
-  if have_systemd; then
-    printf '  %-22s' "$AGENT"
-    systemctl is-active "$AGENT" >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
-  elif command -v rc-service >/dev/null 2>&1; then
-    printf '  %-22s' "$AGENT"
-    rc-service "$AGENT" status >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
+  case "$(probe_state)" in
+    run)  printf '  %-22s' "$AGENT"; res "运行中" "$GRN" ;;
+    stop) printf '  %-22s' "$AGENT"; res "已停止" "$RED" ;;
+    *)    printf '  %-22s' "$AGENT"; res "未安装" "$GRA" ;;
+  esac
+  NN="$(nic_now)"
+  if [ -n "$NN" ]; then
+    printf '  %-22s%s\n' "IPv4 上报" "已屏蔽（$NN）"
   else
-    dim "没找到服务管理器"
+    printf '  %-22s%s\n' "IPv4 上报" "开启（面板会显示本机 IPv4）"
+    dim "想隐藏：kp nic off"
   fi
+}
+
+# ── 屏蔽 agent 上报 IPv4 ────────────────────────────────
+# 面板上的 IPv4 大多来自 agent 上报的「本机网卡地址列表」，
+# 跟路由/DNS/hosts 都无关——路由只影响"往外走"，管不了上报。
+# 解法是让 agent 忽略 IPv4 地址族，只上报 IPv6。
+NICENVF="/etc/default/$AGENT"
+NICDROP="/etc/systemd/system/$AGENT.service.d/nic.conf"
+
+# 本机是否有 IPv4（用来提示"其实已经没有了"）
+has_v4() {
+  [ -n "$(ip -br -4 addr show scope global 2>/dev/null)" ]
+}
+has_v6() {
+  [ -n "$(ip -br -6 addr show scope global 2>/dev/null)" ]
+}
+
+# 当前 agent 生效的过滤参数（含注释掉的，说明配过）
+nic_now() {
+  for f in "$NICDROP" "$NICENVF" /etc/conf.d/$AGENT /etc/sysconfig/$AGENT; do
+    [ -f "$f" ] || continue
+    v=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(--?(ignore|no|disable)[-_]?ipv4)|(^[[:space:]]*(IGNORE|DISABLE)_IPV4[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  # 从进程命令行里现场读
+  ps ax 2>/dev/null | grep -v grep \
+    | grep -oE '(\-\-(include|exclude)-nics[= ][^ ]+)|(\-\-?(ignore|no|disable)[-_]?ipv4)' | head -1
+}
+
+cmd_nic() {
+  ACT="${1:-show}"
+  hrt "屏蔽 agent 上报 IPv4"
+
+  CUR="$(nic_now)"
+
+  printf '  %-22s%s\n' "服务名" "$AGENT"
+  printf '  %-22s%s\n' "本机 IPv4" "$(has_v4 && ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' || echo 无)"
+  [ -n "$CUR" ] && printf '  %-22s%s\n' "当前过滤" "$CUR" \
+                || printf '  %-22s%s\n' "当前过滤" "未设置（IPv4、IPv6 都上报）"
+
+  case "$ACT" in
+    show|list)
+      echo
+      dim "面板上的 IPv4 来自 agent 上报的地址列表，不是出口 IP"
+      dim "想让它只上报 IPv6：kp nic off"
+      dim "想恢复默认（两者都报）：kp nic on"
+      return 0 ;;
+    off|hide|drop|exclude)
+      if ! has_v6; then
+        res "本机没有全局 IPv6，屏蔽后可能完全失联" "$RED"
+        dim "先确认 ip -6 addr 有公网地址，再操作"
+        return 1
+      fi
+      ;;
+    on|all|showall|include)
+      : ;;
+    *) res "未知参数：$ACT" "$RED"; dim "用法：kp nic [show|off|on]"; return 1 ;;
+  esac
+
+  echo
+
+  # 优先用 systemd drop-in，不动原始 service 文件
+  if have_systemd && [ -d /etc/systemd/system ] && [ -n "$AGENT" ]; then
+    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
+      mkdir -p "$(dirname "$NICDROP")" 2>/dev/null
+      cat > "$NICDROP" <<EOF
+# kp: 让 agent 忽略 IPv4，只上报 IPv6 地址
+[Service]
+Environment="IGNORE_IPV4=1"
+EOF
+      printf '  %-22s%s\n' "写入 drop-in" "$NICDROP"
+      dim "IGNORE_IPV4=1"
+    else
+      if [ -f "$NICDROP" ]; then
+        rm -f "$NICDROP"
+        rmdir "$(dirname "$NICDROP")" 2>/dev/null
+        printf '  %-22s%s\n' "移除 drop-in" "已删除"
+      else
+        printf '  %-22s%s\n' "drop-in" "本来就没有"
+      fi
+      if [ -f "$NICENVF" ] && grep -qE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" 2>/dev/null; then
+        grep -vE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" > "$NICENVF.tmp" \
+          && mv "$NICENVF.tmp" "$NICENVF"
+        printf '  %-22s%s\n' "清理 env 文件" "$NICENVF"
+      fi
+    fi
+    systemctl daemon-reload 2>/dev/null && dim "已 daemon-reload"
+  elif command -v rc-service >/dev/null 2>&1; then
+    # OpenRC：写进 /etc/conf.d/<service>
+    CF="/etc/conf.d/$AGENT"
+    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
+      if [ -f "$CF" ]; then
+        cp -a "$CF" "$CF.bak.$(date +%s)" 2>/dev/null
+        grep -vE '^(KP_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
+      else
+        printf '# kp\n' > "$CF"
+      fi
+      printf 'IGNORE_IPV4=1\n' >> "$CF"
+      printf '  %-22s%s\n' "写入 conf.d" "$CF"
+      dim "还需让启动参数带上它，见 /etc/init.d/$AGENT"
+    else
+      if [ -f "$CF" ] && grep -qE '^(KP_NICS|IGNORE_IPV4)=' "$CF" 2>/dev/null; then
+        grep -vE '^(KP_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+        printf '  %-22s%s\n' "移除 conf.d 配置" "已清理"
+      else
+        printf '  %-22s%s\n' "conf.d 配置" "本来就没有"
+      fi
+    fi
+  else
+    res "没有 systemd 或 OpenRC" "$YEL"
+    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
+      dim "手工在启动命令里加：--ignore-ipv4"
+      return 1
+    fi
+    dim "无需处理（本来就没配置过滤）"
+    return 0
+  fi
+
+  echo
+  hr "重启探针"
+  if restart_agent; then
+    printf '  %-22s%s\n' "$AGENT" "已重启"
+  else
+    dim "没能自动重启，请手动重启"
+  fi
+
+  sleep 1
+  echo
+  hr "结果"
+  N2="$(nic_now)"
+  OFF=no
+  case "$ACT" in
+    off|hide|drop|exclude) OFF=yes ;;
+  esac
+  if [ "$OFF" = "yes" ]; then
+    [ -n "$N2" ] && res "  已设置：$N2" "$GRN" \
+                 || { res "  参数没生效" "$RED"; dim "  检查 $NICDROP 是否被其他 env 文件覆盖"; }
+  else
+    [ -z "$N2" ] && res "  已恢复默认（IPv4、IPv6 都上报）" "$GRN" \
+                 || res "  仍有残留：$N2" "$YEL"
+  fi
+  echo
+  dim "参数名以 agent 版本为准，先确认：$AGENT --help | grep -i ipv4"
+  dim "若你的版本用其他写法（如 --ignore-ipv4），直接改 $NICDROP"
 }
 
 # ── 检查更新 ────────────────────────────────────────────
@@ -973,6 +918,7 @@ cmd_update() {
     rm -f "$TMP"
     printf '  %-22s%s\n' "更新" "$OK  $VERSION → $NEW"
     dim "旧版备份：$SELF.bak.$VERSION"
+    clean_old_lockv6 2>/dev/null
     dim "重新进入菜单生效：kp"
   else
     res "没有写入权限" "$YEL"
@@ -984,10 +930,11 @@ cmd_update() {
 
 # ── 菜单 ────────────────────────────────────────────────
 banner() {
-  printf '%s%s\n' "$CYN$BOLD" "  ┌────────────────────────────────┐"
-  printf '%s\n' "  │  kp · 纯 IPv6 切换工具         │"
-  printf '%s%s\n' "  └────────────────────────────────┘" "$RST"
-  printf '  %sv%s%s\n' "$GRA" "$VERSION" "$RST"
+  printf '%s%s\n' "$CYN$BOLD" "  ┌──────────────────────────────────────┐"
+  printf '%s\n' "  │   kp · 纯 IPv6 切换 / 探针自救        │"
+  printf '%s\n' "  │   让被监控机只走 IPv6，且不泄露 IPv4  │"
+  printf '%s%s\n' "  └──────────────────────────────────────┘" "$RST"
+  printf '  %skp %s%s\n' "$GRA" "$VERSION" "$RST"
 }
 
 # ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
@@ -1033,33 +980,115 @@ v6_state() {
 }
 
 menu_status() {
+  NSTATE="上报 IPv4+IPv6"; NCOL="$YEL"
+  [ -n "$(nic_now)" ] && { NSTATE="不上报 IPv4"; NCOL="$CYN"; }
+
+  # 第一行：探针运行 + 上报范围（每行都是一个完整的 printf，保证不换行错位）
   printf '  %s  ' "探针"
   case "$(probe_state)" in
-    run)  printf '%-18s' "$AGENT"; res "● 运行中" "$GRN" ;;
-    stop) printf '%-18s' "$AGENT"; res "● 已停止" "$RED" ;;
-    *)    printf '%-18s' "-"; res "● 未安装" "$GRA" ;;
+    run)  printf '%-16s%s%s  │ %s%s\n' "$AGENT" "$GRN" "运行中" "$NCOL" "$NSTATE" ;;
+    stop) printf '%-16s%s%s  │ %s%s\n' "$AGENT" "$RED" "已停止" "$NCOL" "$NSTATE" ;;
+    *)    printf '%-16s%s%s  │ %s%s\n' "-"      "$GRA" "未安装" "$NCOL" "$NSTATE" ;;
   esac
 
+  # 第二行：IPv4 地址与出网状态
   A4=$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}')
   [ -z "$A4" ] && A4="n/a"
   printf '  %s  ' "IPv4"
-  printf '%-18s' "$A4"
+  printf '%-16s' "$A4"
   case "$(v4_state)" in
-    on)      res "● 出网正常" "$GRN" ;;
-    off)     res "● 出网已切断" "$YEL" ;;
-    blocked) res "● 已封堵" "$YEL" ;;
+    on)      res "│ 出网正常" "$GRN" ;;
+    off)     res "│ 出网已切断" "$YEL" ;;
+    blocked) res "│ 已封堵" "$YEL" ;;
+    *)       res "│ 状态未知" "$GRA" ;;
   esac
 
+  # 第三行：IPv6 地址与出网状态
   A6=$(ip -br -6 addr show scope global 2>/dev/null | awk '{print $3; exit}')
   A6=${A6%%/*}
   [ -z "$A6" ] && A6="n/a"
-  [ ${#A6} -gt 17 ] && A6="$(printf '%s' "$A6" | cut -c1-16)…"
+  [ ${#A6} -gt 16 ] && A6="$(printf '%s' "$A6" | cut -c1-15)…"
   printf '  %s  ' "IPv6"
-  printf '%-18s' "$A6"
+  printf '%-16s' "$A6"
   case "$(v6_state)" in
-    on)  res "● 出网正常" "$GRN" ;;
-    off) res "● 出网不可用" "$RED" ;;
+    on)  res "│ 出网正常" "$GRN" ;;
+    off) res "│ 出网不可用" "$RED" ;;
   esac
+}
+
+# ── 二级菜单：切换出网模式 ──────────────────────────────
+cmd_switch_mode() {
+  hr "切换出网模式"
+  if [ -n "$(ip -4 route show default 2>/dev/null)" ]; then
+    printf '  %-22s%s\n' "当前模式" "IPv4 + IPv6 都通"
+    echo
+    dim "切到 IPv6-only 后，IPv4 将无法访问公网"
+    dim "内网与已建立的 SSH 连接不受影响"
+    echo
+    if ask "切到 IPv6-only？"; then
+      cmd_check yes
+    else
+      echo "  已取消"
+    fi
+  else
+    printf '  %-22s%s\n' "当前模式" "IPv6-only（IPv4 出网已切断）"
+    echo
+    if ask "恢复 IPv4 出站？"; then
+      cmd_restore
+    else
+      echo "  已取消"
+    fi
+  fi
+}
+
+# ── 二级菜单：防火墙封堵 ────────────────────────────────
+cmd_fire_menu() {
+  hr "IPv4 出站封堵"
+  if command -v iptables >/dev/null 2>&1 \
+     && iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable >/dev/null 2>&1; then
+    printf '  %-22s%s\n' "当前状态" "已封堵"
+    echo
+    if ask "撤除封堵？"; then
+      cmd_unblock
+    else
+      echo "  已取消"
+    fi
+  else
+    printf '  %-22s%s\n' "当前状态" "未封堵"
+    echo
+    dim "封堵比删默认路由更硬，但也依赖 iptables 权限"
+    echo
+    if ask "确认封堵？内网 $LAN 与 SSH 会保留"; then
+      cmd_block
+    else
+      echo "  已取消"
+    fi
+  fi
+}
+
+# ── 二级菜单：面板 IPv4 显示 ────────────────────────────
+cmd_nic_menu() {
+  hr "面板显示的本机 IPv4"
+  if [ -n "$(nic_now)" ]; then
+    printf '  %-22s%s\n' "当前状态" "已屏蔽（agent 不上报 IPv4）"
+    echo
+    if ask "恢复上报 IPv4？"; then
+      cmd_nic on
+    else
+      echo "  已取消"
+    fi
+  else
+    printf '  %-22s%s\n' "当前状态" "未屏蔽（面板会显示本机 IPv4）"
+    echo
+    dim "面板上的 IPv4 来自 agent 上报的网卡地址，不是出口 IP"
+    dim "屏蔽后 agent 只上报 IPv6，面板不再显示本机 IPv4"
+    echo
+    if ask "屏蔽 agent 上报 IPv4？"; then
+      cmd_nic off
+    else
+      echo "  已取消"
+    fi
+  fi
 }
 
 cmd_menu() {
@@ -1071,50 +1100,32 @@ cmd_menu() {
     echo
     item "1" "查看当前状态"
     item "2" "探测能否纯 IPv6（自动还原）"
-    item "3" "切换到 IPv6-only"
-    item "4" "恢复 IPv4 出站"
-    item "5" "修复 DNS（IPv6 + IPv4 可选）"
-    item "6" "重启探针"
-    item "7" "禁止 IPv4 出站（iptables）"
-    item "8" "撤除封堵"
-    item "9" "持久化（重启后仍保持）"
-    item "10" "锁定域名走 IPv6（可增删）"
-    item "11" "检查更新（只看）"
-    item "12" "安装更新"
+    item "3" "切换出网模式（IPv6-only ⇄ 恢复 IPv4）"
+    item "4" "修复 DNS（IPv6 + IPv4 可选）"
+    item "5" "重启探针"
+    item "6" "IPv4 出站封堵（iptables 开/关）"
+    item "7" "屏蔽面板显示的本机 IPv4"
+    item "8" "持久化（重启后仍保持）"
+    item "9" "检查更新"
     item "0" "退出"
     echo
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
-    dim "想切回来：选 4 恢复 IPv4 出站"
-    dim "防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9"
+    dim "面板显示本机 IPv4：选 7（路由管不了 agent 上报）"
+    dim "防止 dhcpcd 续约把 IPv4 装回来：切完记得选 8"
     echo
-    printf '  %s请选择 [0-12]: %s' "$CYN" "$RST"
+    printf '  %s请选择 [0-9]: %s' "$CYN" "$RST"
     read -r c || return 0
 
     case "$c" in
       1) cmd_status; pause ;;
       2) cmd_check no; pause ;;
-      3)
-        if ask "切换后 IPv4 将无法访问公网，确认？"; then
-          cmd_check yes
-        else
-          echo "  已取消"
-        fi
-        pause ;;
-      4) cmd_restore; pause ;;
-      5) cmd_fix; pause ;;
-      6) cmd_restart; pause ;;
-      7)
-        if ask "确认禁止 IPv4 出站？内网 $LAN 与 SSH 会保留"; then
-          cmd_block
-        else
-          echo "  已取消"
-        fi
-        pause ;;
-      8) cmd_unblock; pause ;;
-      9) cmd_persist on; pause ;;
-      10) cmd_lockv6_menu; pause ;;
-      11) cmd_update check; pause ;;
-      12) cmd_update ask; pause ;;
+      3) cmd_switch_mode; pause ;;
+      4) cmd_fix; pause ;;
+      5) cmd_restart; pause ;;
+      6) cmd_fire_menu; pause ;;
+      7) cmd_nic_menu; pause ;;
+      8) cmd_persist on; pause ;;
+      9) cmd_update ask; pause ;;
       0) echo; exit 0 ;;
       *) echo "  无效选项"; pause ;;
     esac
@@ -1135,20 +1146,21 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp unblock      撤除封堵
   kp persist      持久化，重启后仍保持 IPv6-only
   kp persist off  取消持久化
-  kp lockv6           域名锁定菜单（增删查）
-  kp lockv6 域名      锁定（多个用逗号分隔）
-  kp lockv6 list      列出已锁定
-  kp lockv6 rm 域名   移除指定
-  kp lockv6 off       全部移除
+  kp nic          查看 agent 是否上报 IPv4
+  kp nic off      不上报 IPv4（面板不再显示本机 IPv4）
+  kp nic on       恢复默认，IPv4、IPv6 都上报
   kp update       检查并提示更新（= kp update ask）
   kp update check 只检查，不安装
   kp update force 直接安装，不询问
+  kp unlock       清理旧版 lockv6 在 /etc/hosts 留下的记录
   kp version      显示版本
   kp status       查看当前网络状态
   kp help         帮助
 
 环境变量：
-  PANEL=面板域名  额外检查面板域名能否解析出 AAAA
+  KP_AGENT=服务名  探针服务名不是 komari-agent 时指定
+  KP_LAN=网段      内网网段不是 10.10.0.0/22 时指定
+  KP_PROC=进程名   探针进程名匹配关键字（默认 komari）
 USAGE
 }
 
@@ -1164,13 +1176,11 @@ case "${1:-}" in
   block)     cmd_block ;;
   unblock)   cmd_unblock ;;
   persist)   cmd_persist "${2:-on}" ;;
-  lockv6)
-    case "${2:-}" in
-      "")        cmd_lockv6_menu ;;
-      list|ls)   cmd_lockv6_list ;;
-      off|clear) cmd_lockv6_off ;;
-      rm|del)    cmd_lockv6_rm "${3:-}" ;;
-      *)         cmd_lockv6 "$2" ;;
+  nic|nics)
+    case "${2:-show}" in
+      off|hide|drop|exclude) cmd_nic off ;;
+      on|all|showall|include) cmd_nic on ;;
+      *) cmd_nic show ;;
     esac
     ;;
   update|upgrade)
@@ -1179,6 +1189,10 @@ case "${1:-}" in
       force|-f|--force|yes|-y) cmd_update force ;;
       *) cmd_update ask ;;
     esac
+    ;;
+  unlock|clean)
+    hr "清理旧版 hosts 锁定"
+    clean_old_lockv6 || dim "没有发现旧记录"
     ;;
   version|-v|--version) echo "kp $VERSION" ;;
   status)    cmd_status ;;

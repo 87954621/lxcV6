@@ -2,7 +2,9 @@
 
 VPS 纯 IPv6 切换脚本，配合 Komari 探针使用。
 
-当前版本：[![](https://img.shields.io/badge/version-1.0.3-blue)](kp.sh) ｜ 更新：`kp update`
+让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
+
+当前版本：[![](https://img.shields.io/badge/version-1.2.0-blue)](kp.sh) ｜ 更新：`kp update`
 
 > 前置：机器已安装 Komari 探针。
 
@@ -35,36 +37,37 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 直接敲 `kp` 进入菜单，按数字选：
 
 ```
-  ┌────────────────────────────────┐
-  │  kp · 纯 IPv6 切换工具         │
-  └────────────────────────────────┘
+  ┌──────────────────────────────────────┐
+  │   kp · 纯 IPv6 切换 / 探针自救        │
+  │   让被监控机只走 IPv6，且不泄露 IPv4  │
+  └──────────────────────────────────────┘
+  kp 1.2.0
 
-  探针  komari-agent      ● 运行中
-  IPv4  10.10.3.66/22     ● 出网已切断
-  IPv6  2600:70ff:b8a0:0… ● 出网正常
+  探针  komari-agent     运行中   │ 上报 IPv4+IPv6
+  IPv4  10.10.3.66/22    出网已切断
+  IPv6  2600:70ff:b8a0:0… 出网正常
 
    1   查看当前状态
    2   探测能否纯 IPv6（自动还原）
-   3   切换到 IPv6-only
-   4   恢复 IPv4 出站
-   5   修复 DNS（IPv6 + IPv4 可选）
-   6   重启探针
-   7   禁止 IPv4 出站（iptables）
-   8   撤除封堵
-   9   持久化（重启后仍保持）
-   10  锁定面板走 IPv6（只改 hosts）
-   11  检查更新（只看）
-   12  安装更新
+   3   切换出网模式（IPv6-only ⇄ 恢复 IPv4）
+   4   修复 DNS（IPv6 + IPv4 可选）
+   5   重启探针
+   6   IPv4 出站封堵（iptables 开/关）
+   7   屏蔽面板显示的本机 IPv4
+   8   持久化（重启后仍保持）
+   9   检查更新
    0   退出
 
   第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
-  想切回来：选 4 恢复 IPv4 出站
-  防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9
+  面板显示本机 IPv4：选 7（路由管不了 agent 上报）
+  防止 dhcpcd 续约把 IPv4 装回来：切完记得选 8
 ```
 
-顶部三行是实时状态，不用进菜单就能看到探针和出网情况。
+顶部三行是实时状态，不用进菜单就能看到探针、上报范围和出网情况。
 
-危险操作（3、7）会先问一次 `y/N` 再执行。
+菜单项 3、6、7 是**开关式**的：进去后先显示当前状态，再问你要不要切到另一边，同一个入口管开也管关。
+
+危险操作都会先问一次 `y/N` 再执行。
 
 也支持非交互调用：
 
@@ -80,11 +83,13 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp restart` | 重启探针 |
 | `kp persist` | 持久化，重启后仍保持 IPv6-only |
 | `kp persist off` | 取消持久化 |
-| `kp lockv6 [域名]` | 锁定面板走 IPv6（只改 hosts，不动路由） |
-| `kp lockv6 off` | 取消锁定 |
+| `kp nic` | 查看 agent 是否上报 IPv4 |
+| `kp nic off` | 不上报 IPv4（面板不再显示本机 IPv4） |
+| `kp nic on` | 恢复默认，IPv4、IPv6 都上报 |
 | `kp update` | 检查更新（有新版会询问） |
 | `kp update check` | 只检查，不安装 |
 | `kp update force` | 直接安装，不询问 |
+| `kp unlock` | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录 |
 | `kp version` | 显示版本 |
 | `kp status` | 查看当前网络状态 |
 | `kp help` | 帮助 |
@@ -108,34 +113,46 @@ kp restart     # 重启探针（自动识别 systemd / OpenRC）
 kp restore     # 恢复 IPv4 出站
 ```
 
-### 只让面板走 IPv6（推荐，最轻量）
+### 面板里还是能看到本机 IPv4？
 
-不想全局禁 IPv4，只希望探针走 IPv6 —— 选菜单 10，或：
+这是**两回事**，先分清面板上那个 IPv4 是哪来的：
+
+| 面板显示的 | 来源 | 用什么管 |
+| --- | --- | --- |
+| 连接来源 IP | 面板服务器看到的出口地址 | `kp keep` / `kp block`（改路由、防火墙） |
+| 本机网卡 IPv4 | agent 主动上报的 `ip addr` 列表 | **`kp nic off`**（改 agent 参数） |
+
+路由和 DNS 只影响"往外走"，管不到 agent 把网卡地址**报上去**。所以即使你切了 IPv6-only，只要 `eth0` 上还留着内网 IPv4，agent 就会把它一起上报。
+
+**选菜单 7，或：**
 
 ```bash
-kp lockv6 你的面板域名
+kp nic off      # 让 agent 忽略 IPv4，只上报 IPv6
 ```
 
-它会查该域名的 AAAA 记录，写进 `/etc/hosts` 并重启探针。**不动路由、不动 DNS、不影响其他 IPv4 访问**，因此也不会有「续约后恢复」的问题。
+它会为 `komari-agent` 写一个 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设置 `IGNORE_IPV4=1`，然后自动重启探针。OpenRC 系统写 `/etc/conf.d/komari-agent`。
 
-撤销：
+> 操作前会检查本机有没有全局 IPv6，没有就拒绝执行（否则可能彻底失联）。
+
+恢复默认：
 
 ```bash
-kp lockv6 off
+kp nic on       # 删掉 drop-in，IPv4、IPv6 都重新上报
 ```
 
-> 前提：面板域名有 AAAA 记录，且 IPv6 地址相对稳定。套 Cloudflare 的域名 IP 会变，不适合这种方式。
+> 参数名以 agent 版本为准，建议先确认：`komari-agent --help | grep -i ipv4`。若你的版本用别的写法（如 `--ignore-ipv4`），改 drop-in 里那一行即可。
 
 ---
 
 ## 注意
 
-- **切换是运行时改动，dhcpcd 续约（约 28 分钟）或重启后 IPv4 默认路由会自动装回来** —— 要长期保持请选菜单 9 或跑 `kp persist`
+- **切换是运行时改动，dhcpcd 续约（约 28 分钟）或重启后 IPv4 默认路由会自动装回来** —— 要长期保持请选菜单 8 或跑 `kp persist`
 - 动手前确认有服务商的 VNC / 控制台，并确保 `ssh -6` 能连进来
 - `kp block` 需要 `NET_ADMIN` 权限，容器里没有的话用 `kp keep`
 - 脚本改的是运行时状态，重启失效；要持久化在 `/etc/dhcpcd.conf` 加 `nogateway`
 - DNS 最多生效 3 个 nameserver（glibc MAXNS），所以 `kp fix` 只写 3 个
 - 服务名不同时用 `KP_AGENT=实际服务名 kp restart`；内网网段不同时用 `KP_LAN=x.x.x.x/x`
+- 面板显示本机 IPv4 ≠ 出网没禁干净，那是 agent 上报的网卡地址，用 `kp nic off` 处理
 
 ---
 
