@@ -1,12 +1,12 @@
 # kp
 
-VPS 纯 IPv6 切换脚本，配合 Komari 探针使用。
+VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
 
 当前版本：[![](https://img.shields.io/badge/version-1.3.0-blue)](kp.sh) ｜ 更新：`kp update`
 
-> 前置：机器已安装 Komari 探针。
+> 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会**自动识别**，也可用 `KP_PROBE=` 强制指定。
 
 ---
 
@@ -100,7 +100,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp restart` | 重启探针 |
 | `kp persist` | 持久化，重启后仍保持 IPv6-only |
 | `kp persist off` | 取消持久化 |
-| `kp nic` | 查看 agent 是否上报 IPv4 |
+| `kp nic` | 查看探针是否上报 IPv4 |
 | `kp nic off` | 不上报 IPv4（面板不再显示本机 IPv4） |
 | `kp nic on` | 恢复默认，IPv4、IPv6 都上报 |
 | `kp update` | 检查更新（有新版会询问） |
@@ -144,20 +144,56 @@ kp restore     # 恢复 IPv4 出站
 **选菜单 7，或：**
 
 ```bash
-kp nic off      # 让 agent 忽略 IPv4，只上报 IPv6
+kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 ```
 
-它会为 `komari-agent` 写一个 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设置 `IGNORE_IPV4=1`，然后自动重启探针。OpenRC 系统写 `/etc/conf.d/komari-agent`。
+脚本会自动判断你装的是哪种探针，走对应的改法：
+
+| 探针 | 关掉 IPv4 上报的做法 |
+| --- | --- |
+| **Komari** | 为 `komari-agent` 写 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设 `IGNORE_IPV4=1`；OpenRC 系统写 `/etc/conf.d/komari-agent` |
+| **哪吒 v2** | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡 |
+
+改完都会自动重启探针。
 
 > 操作前会检查本机有没有全局 IPv6，没有就拒绝执行（否则可能彻底失联）。
 
 恢复默认：
 
 ```bash
-kp nic on       # 删掉 drop-in，IPv4、IPv6 都重新上报
+kp nic on       # Komari 删掉 drop-in；哪吒删掉 nic_allowlist 段。两者都重新上报
 ```
 
-> 参数名以 agent 版本为准，建议先确认：`komari-agent --help | grep -i ipv4`。若你的版本用别的写法（如 `--ignore-ipv4`），改 drop-in 里那一行即可。
+> 参数名以探针版本为准，建议先确认：`komari-agent --help | grep -i ipv4`。Komari 若你的版本用别的写法（如 `--ignore-ipv4`），改 drop-in 里那一行即可。
+
+### 哪吒（Nezha）探针
+
+哪吒 v2 的 agent 用 YAML 里的 `nic_allowlist` 决定**监控哪些网卡**，不写就是全部监控：
+
+```yaml
+# /opt/nezha/agent/config.yml
+nic_allowlist:
+  eth0: true
+  eth1: false
+```
+
+`kp nic off` 会自动列出本机有公网 IPv6 的网卡，写成 `: true`，其余网卡不列（等于不监控），内网 IPv4 就不会再出现在面板上。
+
+识别规则（从上往下，命中即停）：
+
+1. 存在 `/opt/nezha/agent/config.yml` 或 `/etc/nezha/config.yml`
+2. 有 `nezha-agent` 的 systemd 单元或 `/etc/init.d/nezha-agent`
+3. 进程列表里有 `nezha-agent`
+
+识别不出来时，用环境变量强制指定：
+
+```bash
+KP_PROBE=nezha kp nic off
+```
+
+> ⚠️ 哪吒面板支持**下发远程配置**，如果面板侧也配了 `nic_allowlist`，通常会覆盖本机文件。面板能改的话，优先在面板改更稳妥。
+>
+> 改完配置建议留意 `ip_report_period`（本机 IP 更新间隔，默认 1800 秒）——面板上的地址列表不会立刻刷新。
 
 ---
 
@@ -169,7 +205,9 @@ kp nic on       # 删掉 drop-in，IPv4、IPv6 都重新上报
 - 脚本改的是运行时状态，重启失效；要持久化在 `/etc/dhcpcd.conf` 加 `nogateway`
 - DNS 最多生效 3 个 nameserver（glibc MAXNS），所以 `kp fix` 只写 3 个
 - 服务名不同时用 `KP_AGENT=实际服务名 kp restart`；内网网段不同时用 `KP_LAN=x.x.x.x/x`
-- 面板显示本机 IPv4 ≠ 出网没禁干净，那是 agent 上报的网卡地址，用 `kp nic off` 处理
+- 探针识别不准时用 `KP_PROBE=komari` 或 `KP_PROBE=nezha` 强制指定
+- 面板显示本机 IPv4 ≠ 出网没禁干净，那是探针上报的网卡地址，用 `kp nic off` 处理
+- 哪吒的 `nic_allowlist` 可能被面板下发的远程配置覆盖，面板能改就优先在面板改
 
 ---
 

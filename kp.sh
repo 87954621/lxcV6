@@ -3,13 +3,15 @@
 #
 # 直接运行 kp 进入交互式菜单，按提示一步步选。
 #
+# 支持 Komari 与 哪吒 Nezha v2 探针，自动识别（也可 KP_PROBE= 强制指定）。
+#
 # 也支持非交互调用：
 #   kp check     探测能否纯 IPv6 存活，结束自动还原（最安全）
 #   kp keep      探测后不还原，直接切到 IPv6-only
 #   kp restore   恢复 IPv4 出站
 #   kp fix       换成 IPv6 DNS
 #   kp restart   重启探针
-#   kp nic off   让 agent 不上报 IPv4（面板不再显示本机 IPv4）
+#   kp nic off   让探针不上报 IPv4（面板不再显示本机 IPv4）
 #   kp block     iptables 硬性禁止 IPv4 出站
 #   kp unblock   撤除封堵
 #   kp status    查看当前网络状态
@@ -17,6 +19,7 @@
 #
 # 环境变量：
 #   PANEL=面板域名   额外检查面板域名能否解析出 AAAA
+#   KP_PROBE=        komari|nezha，强制指定探针种类（默认 auto）
 #
 # 安装：
 #   wget -qO /usr/local/bin/kp https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh && chmod +x /usr/local/bin/kp && kp
@@ -34,6 +37,10 @@ LAN="10.10.0.0/22"
 AGENT="komari-agent"
 [ -n "${KP_AGENT:-}" ] && AGENT="$KP_AGENT"   # 可用 KP_AGENT=xxx 覆盖服务名
 [ -n "${KP_LAN:-}" ] && LAN="$KP_LAN"         # 可用 KP_LAN=x.x.x.x/x 覆盖内网网段
+
+# 探针种类：auto 自动识别（komari / nezha），也可用 KP_PROBE=komari|nezha 强制
+PROBE=""; KP_PROBE="${KP_PROBE:-auto}"
+
 D1="2606:4700:4700::1111"     # IPv6 DNS · Cloudflare
 D2="2606:4700:4700::1001"
 D3="2001:4860:4860::8888"     # IPv6 DNS · Google
@@ -158,16 +165,33 @@ OK="${BGRN}✔ OK${RST}"; FAIL="${BRED}✘ 失败${RST}"; WARN="${BYEL}▲ 注�
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
-# 重启探针：依次尝试 systemd / OpenRC / service
+# 探针服务名：Komari 用 AGENT（默认 komari-agent）；
+# 哪吒的单元名固定是 nezha-agent，不用靠 AGENT 猜。
+unit_name() {
+  if [ "$(probe_kind)" = "nezha" ]; then printf 'nezha-agent'; else printf '%s' "$AGENT"; fi
+}
+
+# 重启探针：先按识别的服务名，再逐个回落到常见候选名。
+# 依次尝试 systemd / OpenRC / service
 restart_agent() {
+  U="$(unit_name)"
   if have_systemd; then
-    systemctl restart "$AGENT" 2>/dev/null && return 0
+    for u in "$U" "$AGENT" komari-agent nezha-agent; do
+      [ -n "$u" ] || continue
+      systemctl restart "$u" 2>/dev/null && return 0
+    done
   fi
   if command -v rc-service >/dev/null 2>&1; then
-    rc-service "$AGENT" restart >/dev/null 2>&1 && return 0
+    for u in "$U" "$AGENT" komari-agent nezha-agent; do
+      [ -n "$u" ] || continue
+      rc-service "$u" restart >/dev/null 2>&1 && return 0
+    done
   fi
   if command -v service >/dev/null 2>&1; then
-    service "$AGENT" restart >/dev/null 2>&1 && return 0
+    for u in "$U" "$AGENT" komari-agent nezha-agent; do
+      [ -n "$u" ] || continue
+      service "$u" restart >/dev/null 2>&1 && return 0
+    done
   fi
   return 1
 }
@@ -600,9 +624,15 @@ cmd_restart() {
   # 服务方式失败时，给出可操作的排查信息
   hr "排查"
   BIN=""
-  for p in /opt/komari/komari-agent /usr/local/bin/komari-agent /usr/bin/komari-agent; do
-    [ -x "$p" ] && BIN="$p" && break
-  done
+  if [ "$(probe_kind)" = "nezha" ]; then
+    for p in /opt/nezha/agent/nezha-agent /usr/local/bin/nezha-agent /usr/bin/nezha-agent; do
+      [ -x "$p" ] && BIN="$p" && break
+    done
+  else
+    for p in /opt/komari/komari-agent /usr/local/bin/komari-agent /usr/bin/komari-agent; do
+      [ -x "$p" ] && BIN="$p" && break
+    done
+  fi
   [ -z "$BIN" ] && BIN=$(command -v "$AGENT" 2>/dev/null)
 
   if [ -n "$BIN" ]; then
@@ -611,11 +641,15 @@ cmd_restart() {
     ps ax 2>/dev/null | grep -v grep | grep -q "$AGENT" \
       && res "运行中" "$GRN" || res "未运行" "$RED"
     dim "没有注册成服务，手动启动："
-    dim "$BIN -e https://面板域名 -t Token &"
+    if [ "$(probe_kind)" = "nezha" ]; then
+      dim "$BIN -s 面板地址:端口 -p 密钥 &"
+    else
+      dim "$BIN -e https://面板域名 -t Token &"
+    fi
   else
     kvp "二进制" "未找到"
-    dim "这台机器可能还没装 Komari 探针"
-    dim "确认：ls /opt/komari/   或   ps ax | grep komari"
+    dim "这台机器可能还没装探针"
+    dim "确认：ls /opt/komari/  或  ls /opt/nezha/agent/"
   fi
   dim "若服务名不同，用 KP_AGENT=实际服务名 kp restart"
   return 1
@@ -812,10 +846,55 @@ cmd_status() {
   fi
 }
 
+# ── 探针识别 ────────────────────────────────────────────
+# komari-agent 用环境变量 IGNORE_IPV4；哪吒 v2 用 YAML nic_allowlist。
+# 自动识别：优先看配置文件/服务存在性，其次看进程。
+probe_kind() {
+  case "$KP_PROBE" in
+    komari|nezha) printf '%s' "$KP_PROBE"; return ;;
+  esac
+  # 哪吒 v2：配置文件或服务单元
+  for f in /opt/nezha/agent/config.yml /etc/nezha/config.yml; do
+    [ -f "$f" ] && { printf 'nezha'; return; }
+  done
+  if have_systemd; then
+    systemctl list-unit-files 2>/dev/null | grep -q '^nezha-agent' && { printf 'nezha'; return; }
+  fi
+  [ -f /etc/init.d/nezha-agent ] && { printf 'nezha'; return; }
+  # Komari
+  for f in /opt/komari/komari-agent /usr/local/bin/komari-agent; do
+    [ -e "$f" ] && { printf 'komari'; return; }
+  done
+  if have_systemd; then
+    systemctl list-unit-files 2>/dev/null | grep -q '^komari-agent' && { printf 'komari'; return; }
+  fi
+  # 进程兜底
+  if ps ax 2>/dev/null | grep -v grep | grep -qi 'nezha-agent'; then printf 'nezha'; return; fi
+  if ps ax 2>/dev/null | grep -v grep | grep -qi 'komari'; then printf 'komari'; return; fi
+  printf 'komari'
+}
+
+# 哪吒 v2 的 agent 配置文件（多个则取第一个存在的）
+nezha_conf() {
+  for f in /opt/nezha/agent/config.yml /etc/nezha/config.yml /opt/nezha/agent/config.yaml; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  # 兜底：从服务单元里找 -c 指定的配置
+  for u in /etc/systemd/system/nezha-agent.service /lib/systemd/system/nezha-agent.service \
+           /etc/systemd/system/nezha-agent@.service /etc/init.d/nezha-agent; do
+    [ -f "$u" ] || continue
+    p=$(grep -oE '\-c[= ][^ "'"'"']+\.ya?ml' "$u" 2>/dev/null | head -1 | sed -E 's/^-c[= ]//')
+    [ -n "$p" ] && [ -f "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  printf ''
+}
+
 # ── 屏蔽 agent 上报 IPv4 ────────────────────────────────
 # 面板上的 IPv4 大多来自 agent 上报的「本机网卡地址列表」，
 # 跟路由/DNS/hosts 都无关——路由只影响"往外走"，管不了上报。
-# 解法是让 agent 忽略 IPv4 地址族，只上报 IPv6。
+# 解法：让 agent 不再上报 IPv4 地址。
+#   Komari → 环境变量 IGNORE_IPV4=1（systemd drop-in / env 文件）
+#   哪吒v2 → YAML 配置 nic_allowlist（只放行 IPv6 网卡）
 NICENVF="/etc/default/$AGENT"
 NICDROP="/etc/systemd/system/$AGENT.service.d/nic.conf"
 
@@ -827,8 +906,22 @@ has_v6() {
   [ -n "$(ip -br -6 addr show scope global 2>/dev/null)" ]
 }
 
-# 当前 agent 生效的过滤参数（含注释掉的，说明配过）
+# 有全局 IPv6 的网卡名（哪吒 nic_allowlist 要用）
+v6_nics() {
+  ip -br -6 addr show scope global 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' '
+}
+
+# 当前 agent 生效的过滤参数
 nic_now() {
+  if [ "$(probe_kind)" = "nezha" ]; then
+    CF="$(nezha_conf)"
+    [ -z "$CF" ] && return 0
+    # nic_allowlist 下有条目即视为已配置过滤
+    if grep -qE '^[[:space:]]*nic_allowlist' "$CF" 2>/dev/null; then
+      printf 'nic_allowlist（哪吒，仅监控允许的网卡）'
+    fi
+    return 0
+  fi
   for f in "$NICDROP" "$NICENVF" /etc/conf.d/$AGENT /etc/sysconfig/$AGENT; do
     [ -f "$f" ] || continue
     v=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(--?(ignore|no|disable)[-_]?ipv4)|(^[[:space:]]*(IGNORE|DISABLE)_IPV4[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
@@ -839,22 +932,129 @@ nic_now() {
     | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--?(ignore|no|disable)[-_]?ipv4)' | head -1
 }
 
+# ── 哪吒：改 YAML 的 nic_allowlist ──────────────────────
+# 只放行有 IPv6 的网卡，等于让 agent 不上报内网 IPv4。
+nezha_nic_off() {
+  CF="$(nezha_conf)"
+  if [ -z "$CF" ]; then
+    res "找不到哪吒配置文件" "$RED"
+    dim "常见位置：/opt/nezha/agent/config.yml"
+    dim "可用 KP_PROBE=nezha 强制按哪吒处理"
+    return 1
+  fi
+  kvp "配置文件" "$CF"
+
+  NICS="$(v6_nics)"
+  if [ -z "$NICS" ]; then
+    res "没有发现带公网 IPv6 的网卡" "$RED"
+    dim "nic_allowlist 需要至少列一张要监控的网卡"
+    return 1
+  fi
+
+  cp -a "$CF" "$CF.kp.bak.$(date +%s)" 2>/dev/null
+  kvp "备份" "$CF.kp.bak.*"
+
+  python3_missing=0
+  command -v python3 >/dev/null 2>&1 || python3_missing=1
+
+  if [ "$python3_missing" = "0" ]; then
+    # 用 python 安全地插入/替换 nic_allowlist 段（避免 YAML 缩进踩坑）
+    KP_NICS="$NICS" python3 - "$CF" <<'PYEOF'
+import os, re, sys
+p = sys.argv[1]
+nics = os.environ.get("KP_NICS", "").split()
+txt = open(p, encoding="utf-8").read()
+block = "nic_allowlist:\n" + "".join("  %s: true\n" % n for n in nics)
+# 已存在则整段替换（从 nic_allowlist: 到下一个顶层键或 EOF）
+pat = re.compile(r"^nic_allowlist:[^\n]*\n(?:[ \t]+.*\n)*", re.M)
+if pat.search(txt):
+    txt = pat.sub(block, txt)
+else:
+    if txt and not txt.endswith("\n"):
+        txt += "\n"
+    txt += block
+open(p, "w", encoding="utf-8").write(txt)
+PYEOF
+    [ $? -eq 0 ] || { res "写入失败" "$RED"; return 1; }
+  else
+    # 没有 python3：用 awk 硬写（缩进固定两空格）
+    awk -v nics="$NICS" '
+      BEGIN { inblk=0; done=0 }
+      /^nic_allowlist:/ { inblk=1; print "nic_allowlist:"; n=split(nics,a," ");
+        for(i=1;i<=n;i++) if(a[i]!="") print "  " a[i] ": true"; done=1; next }
+      inblk==1 { if ($0 ~ /^[^ \t]/) inblk=0; else next }
+      { print }
+      END { if (!done) { print "nic_allowlist:"; n=split(nics,a," ");
+        for(i=1;i<=n;i++) if(a[i]!="") print "  " a[i] ": true" } }
+    ' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+  fi
+
+  kvp "只监控网卡" "$NICS"
+  dim "agent 将不上报其他网卡，内网 IPv4 不再出现在面板"
+  return 0
+}
+
+nezha_nic_on() {
+  CF="$(nezha_conf)"
+  [ -z "$CF" ] && { res "找不到哪吒配置文件" "$RED"; return 1; }
+  if ! grep -qE '^[[:space:]]*nic_allowlist' "$CF" 2>/dev/null; then
+    kvp "nic_allowlist" "本来就没有"
+    return 0
+  fi
+  cp -a "$CF" "$CF.kp.bak.$(date +%s)" 2>/dev/null
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$CF" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+txt = open(p, encoding="utf-8").read()
+txt = re.sub(r"^nic_allowlist:[^\n]*\n(?:[ \t]+.*\n)*", "", txt, flags=re.M)
+open(p, "w", encoding="utf-8").write(txt)
+PYEOF
+  else
+    awk '/^nic_allowlist:/{skip=1;next} skip==1&&/^[ \t]/{next} {skip=0;print}' "$CF" > "$CF.tmp" \
+      && mv "$CF.tmp" "$CF"
+  fi
+  kvp "nic_allowlist" "已移除（恢复监控全部网卡）"
+  return 0
+}
+
 cmd_nic() {
   ACT="${1:-show}"
+  KIND="$(probe_kind)"
   hrt "屏蔽 agent 上报 IPv4"
 
   CUR="$(nic_now)"
 
-  kvp "服务名" "$AGENT"
+  # 哪吒：先算一次配置路径（空则显示「未找到」而不是空白）
+  NCF=""
+  [ "$KIND" = "nezha" ] && NCF="$(nezha_conf)"
+
+  kvp "探针类型" "$( [ "$KIND" = "nezha" ] && echo "哪吒 Nezha v2" || echo "Komari" )"
+  if [ "$KIND" = "nezha" ]; then
+    kvp "服务名" "$(unit_name)"
+    kvp "配置文件" "$( [ -n "$NCF" ] && echo "$NCF" || echo "未找到（用 KP_PROBE=nezha 仍可强制）" )"
+  else
+    kvp "服务名" "$AGENT"
+  fi
   kvp "本机 IPv4" "$(has_v4 && ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' || echo 无)"
   [ -n "$CUR" ] && kvp "当前过滤" "$CUR" \
                 || kvp "当前过滤" "未设置（IPv4、IPv6 都上报）"
+
+  if [ "$KIND" = "nezha" ]; then
+    CF="$(nezha_conf)"
+    if [ -z "$CF" ]; then
+      res "找不到哪吒配置文件" "$RED"
+      dim "常见位置：/opt/nezha/agent/config.yml"
+      dim "可用 KP_PROBE=nezha 强制按哪吒处理"
+      return 1
+    fi
+  fi
 
   case "$ACT" in
     show|list)
       echo
       dim "面板上的 IPv4 来自 agent 上报的地址列表，不是出口 IP"
-      dim "想让它只上报 IPv6：kp nic off"
+      dim "想让它不上报 IPv4：kp nic off"
       dim "想恢复默认（两者都报）：kp nic on"
       return 0 ;;
     off|hide|drop|exclude)
@@ -862,6 +1062,9 @@ cmd_nic() {
         res "本机没有全局 IPv6，屏蔽后可能完全失联" "$RED"
         dim "先确认 ip -6 addr 有公网地址，再操作"
         return 1
+      fi
+      if ! has_v4; then
+        dim "本机没有全局 IPv4，屏蔽后效果可能看不出差别"
       fi
       ;;
     on|all|showall|include)
@@ -871,6 +1074,30 @@ cmd_nic() {
 
   echo
 
+  # ── 哪吒：走 YAML 分支 ──
+  if [ "$KIND" = "nezha" ]; then
+    case "$ACT" in
+      off|hide|drop|exclude) nezha_nic_off || return 1 ;;
+      *) nezha_nic_on || return 1 ;;
+    esac
+    echo
+    hr "重启探针"
+    if restart_agent; then kvp "$AGENT" "已重启"; else dim "没能自动重启，请手动重启"; fi
+    sleep 1
+    echo
+    hr "结果"
+    if [ -n "$(nic_now)" ]; then
+      ok "已设置：nic_allowlist 生效中"
+    else
+      ok "已恢复默认（监控全部网卡）"
+    fi
+    echo
+    dim "改的是 $KIND 的配置文件，记得别被面板下发的远程配置覆盖"
+    dim "若面板能改 nic_allowlist，直接在面板改更稳妥"
+    return 0
+  fi
+
+  # ── Komari：走环境变量分支 ──
   # 优先用 systemd drop-in，不动原始 service 文件
   if have_systemd && [ -d /etc/systemd/system ] && [ -n "$AGENT" ]; then
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
@@ -1070,22 +1297,23 @@ banner() {
 # ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
 probe_state() {
   # 探针二进制名可能跟服务名不同（如服务 komari-agent / 进程 agent），
-  # 所以用 komari 做宽匹配，再逐个精确判断
-  PAT="${KP_PROC:-komari}"
+  # 所以按探针种类选匹配关键字：哪吒 → nezha，Komari → komari。
+  if [ "$(probe_kind)" = "nezha" ]; then PAT="${KP_PROC:-nezha}"; else PAT="${KP_PROC:-komari}"; fi
+  U="$(unit_name)"
 
   if have_systemd; then
-    systemctl is-active "$AGENT" >/dev/null 2>&1 && { printf 'run'; return; }
-    systemctl list-unit-files "$AGENT.service" >/dev/null 2>&1 && { printf 'stop'; return; }
+    systemctl is-active "$U" >/dev/null 2>&1 && { printf 'run'; return; }
+    systemctl list-unit-files "$U.service" >/dev/null 2>&1 && { printf 'stop'; return; }
   fi
   if command -v rc-service >/dev/null 2>&1; then
-    if rc-service "$AGENT" status >/dev/null 2>&1; then
+    if rc-service "$U" status >/dev/null 2>&1; then
       # supervise-daemon 跑的服务，status 在有些版本会误报，再用 pidfile 复核
-      if [ -f "/run/$AGENT.pid" ] && kill -0 "$(cat "/run/$AGENT.pid" 2>/dev/null)" 2>/dev/null; then
+      if [ -f "/run/$U.pid" ] && kill -0 "$(cat "/run/$U.pid" 2>/dev/null)" 2>/dev/null; then
         printf 'run'; return
       fi
       printf 'run'; return
     fi
-    [ -f "/etc/init.d/$AGENT" ] && { printf 'stop'; return; }
+    [ -f "/etc/init.d/$U" ] && { printf 'stop'; return; }
   fi
   # 兜底：按进程名匹配（含 supervise-daemon 包装的）
   if ps ax 2>/dev/null | grep -v grep | grep -qi "$PAT"; then
@@ -1310,7 +1538,7 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp unblock      撤除封堵
   kp persist      持久化，重启后仍保持 IPv6-only
   kp persist off  取消持久化
-  kp nic          查看 agent 是否上报 IPv4
+  kp nic          查看探针是否上报 IPv4
   kp nic off      不上报 IPv4（面板不再显示本机 IPv4）
   kp nic on       恢复默认，IPv4、IPv6 都上报
   kp update       检查并提示更新（= kp update ask）
@@ -1321,10 +1549,16 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp status       查看当前网络状态
   kp help         帮助
 
+支持的探针（自动识别，也可强制指定）：
+  Komari   → IGNORE_IPV4=1，走 systemd drop-in / env 文件
+  哪吒 Nezha → nic_allowlist，改 /opt/nezha/agent/config.yml
+  面板上的 IPv4 来自 agent 上报的地址列表，路由/DNS 都管不了，只能改 agent 配置。
+
 环境变量：
+  KP_PROBE=komari|nezha  强制指定探针种类（默认 auto 自动识别）
   KP_AGENT=服务名  探针服务名不是 komari-agent 时指定
   KP_LAN=网段      内网网段不是 10.10.0.0/22 时指定
-  KP_PROC=进程名   探针进程名匹配关键字（默认 komari）
+  KP_PROC=进程名   探针进程名匹配关键字（默认按探针种类取 komari / nezha）
 USAGE
 }
 
