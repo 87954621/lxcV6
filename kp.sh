@@ -59,6 +59,20 @@ OK="${GRN}OK${RST}"; FAIL="${RED}失败${RST}"; WARN="${YEL}注意${RST}"
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
+# 重启探针：依次尝试 systemd / OpenRC / service
+restart_agent() {
+  if have_systemd; then
+    systemctl restart "$AGENT" 2>/dev/null && return 0
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "$AGENT" restart >/dev/null 2>&1 && return 0
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service "$AGENT" restart >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
 # 注意 glibc 最多只用前 3 个 nameserver（MAXNS=3），写多了会被忽略。
 # 顺序很重要：解析器从第 1 个开始问，超时才换下一个，
 # 所以把能用的那个放前面，避免每次解析都干等超时。
@@ -624,73 +638,123 @@ panel_domain() {
 }
 
 cmd_lockv6() {
-  hr "锁定面板走 IPv6"
+  hr "锁定域名走 IPv6"
   D=$(panel_domain "${1:-}")
   if [ -z "$D" ]; then
-    res "拿不到面板域名" "$RED"
-    dim "用法：kp lockv6 面板域名"
-    dim "或先设置：PANEL=面板域名 kp lockv6"
-    return 1
-  fi
-  printf '  %-22s%s\n' "面板域名" "$D"
-
-  # 解析 AAAA
-  A6=$(getent ahostsv6 "$D" 2>/dev/null | awk '{print $1}' | grep ':' | head -1)
-  if [ -z "$A6" ]; then
-    res "该域名没有 AAAA 记录" "$RED"
-    dim "纯 IPv6 下无法连接。请给域名加 AAAA，或改用 kp block 全局封堵"
-    return 1
-  fi
-  printf '  %-22s%s\n' "IPv6 地址" "$A6"
-
-  A4=$(getent ahostsv4 "$D" 2>/dev/null | awk '{print $1; exit}')
-  if [ -n "$A4" ]; then
-    printf '  %-22s%s\n' "IPv4 地址" "$A4"
-    dim "将通过 hosts 屏蔽，避免探针走它"
-  fi
-
-  # 写入 /etc/hosts
-  if [ -f "$HOSTS" ]; then
-    cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
-    if grep -q "$MARK" "$HOSTS" 2>/dev/null; then
-      grep -v "$MARK" "$HOSTS" > "$HOSTS.tmp" && mv "$HOSTS.tmp" "$HOSTS"
-      dim "已替换原有 kp 记录"
-    fi
-    printf '%s %s %s\n' "$A6" "$D" "$MARK" >> "$HOSTS"
-    printf '  %-22s%s\n' "写入 /etc/hosts" "$OK"
-    dim "$A6 $D"
-  else
-    res "/etc/hosts 不存在" "$RED"
+    res "拿不到域名" "$RED"
+    dim "用法：kp lockv6 域名"
+    dim "或先设置：PANEL=域名 kp lockv6"
+    dim "多个域名用逗号分隔：kp lockv6 a.com,b.com"
     return 1
   fi
 
-  # 有些解析器会直接读 hosts，但进程多半已缓存
+  OKN=0; FAILN=0
+  OLDIFS="$IFS"; IFS=','
+  for dom in $D; do
+    IFS="$OLDIFS"
+    dom=$(printf '%s' "$dom" | tr -d ' ')
+    [ -z "$dom" ] && continue
+    lock_one "$dom" && OKN=$((OKN + 1)) || FAILN=$((FAILN + 1))
+    IFS=','
+  done
+  IFS="$OLDIFS"
+
+  echo
   hr "重启探针"
   if restart_agent; then
-    printf '  %-22s%s\n' "$AGENT" "$OK"
+    printf '  %-22s%s\n' "$AGENT" "已重启"
   else
-    dim "没找到 $AGENT 服务，请手动重启"
+    dim "没能自动重启，请手动执行：rc-service $AGENT restart"
   fi
 
   hr "验证"
-  printf '  %-22s' "域名解析"
-  RN=$(getent ahosts "$D" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-  if echo "$RN" | grep -q ':'; then
-    res "$RN" "$GRN"
-    if echo "$RN" | grep -qE '(^| )[0-9]+\.'; then
-      dim "注意：仍返回了 IPv4 地址，探针可能还会尝试走它"
+  for dom in $(hosts_domains); do
+    printf '  %-22s' "$dom"
+    RN=$(getent ahosts "$dom" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    if echo "$RN" | grep -q ':'; then
+      if echo "$RN" | grep -qE '(^| )[0-9]+\.'; then
+        res "$RN" "$YEL"; dim "仍返回 IPv4，探针可能还会尝试走它"
+      else
+        res "$RN" "$GRN"
+      fi
     else
-      dim "只返回 IPv6，符合预期"
+      res "${RN:-解析失败}" "$RED"
     fi
-  else
-    res "$RN" "$YEL"
+  done
+
+  echo
+  printf '  %-22s%d 个成功' "结果" "$OKN"
+  [ "$FAILN" -gt 0 ] && res "，$FAILN 个失败" "$RED" || echo
+  dim "查看/管理：kp lockv6 list"
+  dim "撤销全部：kp lockv6 off"
+}
+
+lock_one() {
+  dom="$1"
+  printf '  %-22s%s\n' "域名" "$dom"
+
+  A6=$(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}' | grep ':' | head -1)
+  if [ -z "$A6" ]; then
+    res "  没有 AAAA 记录，跳过" "$RED"
+    return 1
+  fi
+  printf '  %-22s%s\n' "  IPv6" "$A6"
+  A4=$(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1; exit}')
+  [ -n "$A4" ] && printf '  %-22s%s\n' "  IPv4（将屏蔽）" "$A4"
+
+  if [ ! -f "$HOSTS" ]; then
+    res "  /etc/hosts 不存在" "$RED"
+    return 1
   fi
 
-  printf '  %-22s' "IPv6 可达"
-  curl -6 -m 5 -s -o /dev/null -w '%{http_code}' "https://$D" 2>/dev/null | grep -qE '^[1-5]' \
-    && res "OK" "$GRN" || res "无响应" "$YEL"
+  cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
+  # 只删这个域名的旧记录，其他域名保留
+  if awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {found=1} END{exit !found}' "$HOSTS"; then
+    awk -v m="$MARK" -v d="$dom" '!($0 ~ m && $2 == d)' "$HOSTS" > "$HOSTS.tmp" \
+      && mv "$HOSTS.tmp" "$HOSTS"
+  fi
+  printf '%s %s %s\n' "$A6" "$dom" "$MARK" >> "$HOSTS"
+  printf '  %-22s%s\n' "  写入 hosts" "$OK"
+  return 0
+}
 
-  dim "撤销：kp lockv6 off"
+hosts_domains() {
+  awk -v m="$MARK" '$0 ~ m {print $2}' "$HOSTS" 2>/dev/null
+}
+
+cmd_lockv6_list() {
+  hr "已锁定的域名"
+  DS=$(hosts_domains)
+  if [ -z "$DS" ]; then
+    dim "没有锁定任何域名"
+    dim "添加：kp lockv6 域名"
+    return 0
+  fi
+  for dom in $DS; do
+    A=$(awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {print $1; exit}' "$HOSTS")
+    printf '  %-34s %s\n' "$dom" "$A"
+  done
+  echo
+  dim "移除某个：kp lockv6 rm 域名"
+  dim "全部移除：kp lockv6 off"
+}
+
+cmd_lockv6_rm() {
+  dom="${1:-}"
+  if [ -z "$dom" ]; then
+    res "请指定域名：kp lockv6 rm 域名" "$RED"
+    return 1
+  fi
+  hr "移除 $dom"
+  if ! hosts_domains | grep -qx "$dom"; then
+    dim "该域名不在锁定列表里"
+    return 0
+  fi
+  cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
+  awk -v m="$MARK" -v d="$dom" '!($0 ~ m && $2 == d)' "$HOSTS" > "$HOSTS.tmp" \
+    && mv "$HOSTS.tmp" "$HOSTS"
+  printf '  %-22s%s\n' "已移除" "$OK"
+  restart_agent 2>/dev/null && dim "已重启 $AGENT"
 }
 
 cmd_lockv6_off() {
@@ -707,6 +771,62 @@ cmd_lockv6_off() {
   else
     printf '  %-22s%s\n' "k p 记录" "本来就没有"
   fi
+}
+
+# 域名锁定的二级菜单
+cmd_lockv6_menu() {
+  while :; do
+    hr "锁定域名走 IPv6"
+    DS=$(hosts_domains)
+    if [ -n "$DS" ]; then
+      echo "  已锁定："
+      for dom in $DS; do
+        A=$(awk -v m="$MARK" -v d="$dom" '$0 ~ m && $2 == d {print $1; exit}' "$HOSTS")
+        printf '    %s%-30s%s %s\n' "$GRN" "$dom" "$RST" "$A"
+      done
+    else
+      dim "当前没有锁定任何域名"
+    fi
+    echo
+    item "1" "添加域名"
+    item "2" "移除域名"
+    item "3" "全部移除"
+    item "0" "返回"
+    echo
+    printf '  %s请选择 [0-3]: %s' "$CYN" "$RST"
+    read -r m || return 0
+    case "$m" in
+      1)
+        DEF=$(panel_domain "")
+        printf '  域名'
+        [ -n "$DEF" ] && printf ' %s[%s]%s' "$GRA" "$DEF" "$RST"
+        printf '（多个用逗号分隔）: '
+        read -r in || in=""
+        [ -z "$in" ] && in="$DEF"
+        if [ -z "$in" ]; then
+          echo "  没有输入域名"
+        elif ask "写入 /etc/hosts 并重启探针？"; then
+          cmd_lockv6 "$in"
+        else
+          echo "  已取消"
+        fi
+        pause ;;
+      2)
+        printf '  要移除的域名: '
+        read -r rm || rm=""
+        cmd_lockv6_rm "$rm"
+        pause ;;
+      3)
+        if ask "移除全部锁定？"; then
+          cmd_lockv6_off
+        else
+          echo "  已取消"
+        fi
+        pause ;;
+      0) return 0 ;;
+      *) echo "  无效选项" ;;
+    esac
+  done
 }
 
 # ── 状态 ────────────────────────────────────────────────
@@ -786,6 +906,7 @@ ver_gt() {   # $1 > $2 ?
 }
 
 cmd_update() {
+  MODE="${1:-ask}"
   hr "检查更新"
   printf '  %-22s%s\n' "当前版本" "$VERSION"
 
@@ -806,24 +927,37 @@ cmd_update() {
   fi
 
   echo
-  if [ "${1:-}" != "force" ] && ! ask "有新版本，现在更新？"; then
-    echo "  已取消"
+  printf '  %s发现新版本：%s → %s%s\n' "$YEL" "$VERSION" "$NEW" "$RST"
+
+  # check 模式：只看不装
+  if [ "$MODE" = "check" ]; then
+    dim "本次只检查，未更新。要更新请选菜单里的「安装更新」"
+    return 0
+  fi
+
+  # ask 模式：先问
+  if [ "$MODE" = "ask" ] && ! ask "现在更新？"; then
+    echo "  已取消，未做任何改动"
     return 0
   fi
 
   # 更新前自检：能跑就留一份备份
   TMP=$(mktemp 2>/dev/null || echo "/tmp/kp.new.$$")
+  printf '  %-22s' "下载"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL -m 15 "$RAW_URL" -o "$TMP" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
     wget -qO "$TMP" "$RAW_URL" 2>/dev/null
+  elif command -v busybox >/dev/null 2>&1; then
+    busybox wget -qO "$TMP" "$RAW_URL" 2>/dev/null
   fi
 
   if [ ! -s "$TMP" ]; then
-    res "下载失败" "$RED"
+    res "失败" "$RED"
     rm -f "$TMP"
     return 1
   fi
+  res "OK" "$GRN"
 
   printf '  %-22s' "校验"
   if [ "$(head -1 "$TMP" | cut -c1-9)" != "#!/bin/sh" ] || ! sh -n "$TMP" 2>/dev/null; then
@@ -858,15 +992,28 @@ banner() {
 
 # ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
 probe_state() {
+  # 探针二进制名可能跟服务名不同（如服务 komari-agent / 进程 agent），
+  # 所以用 komari 做宽匹配，再逐个精确判断
+  PAT="${KP_PROC:-komari}"
+
   if have_systemd; then
     systemctl is-active "$AGENT" >/dev/null 2>&1 && { printf 'run'; return; }
     systemctl list-unit-files "$AGENT.service" >/dev/null 2>&1 && { printf 'stop'; return; }
   fi
   if command -v rc-service >/dev/null 2>&1; then
-    rc-service "$AGENT" status >/dev/null 2>&1 && { printf 'run'; return; }
+    if rc-service "$AGENT" status >/dev/null 2>&1; then
+      # supervise-daemon 跑的服务，status 在有些版本会误报，再用 pidfile 复核
+      if [ -f "/run/$AGENT.pid" ] && kill -0 "$(cat "/run/$AGENT.pid" 2>/dev/null)" 2>/dev/null; then
+        printf 'run'; return
+      fi
+      printf 'run'; return
+    fi
     [ -f "/etc/init.d/$AGENT" ] && { printf 'stop'; return; }
   fi
-  ps ax 2>/dev/null | grep -v grep | grep -q "$AGENT" && { printf 'run'; return; }
+  # 兜底：按进程名匹配（含 supervise-daemon 包装的）
+  if ps ax 2>/dev/null | grep -v grep | grep -qi "$PAT"; then
+    printf 'run'; return
+  fi
   printf 'none'
 }
 
@@ -931,15 +1078,16 @@ cmd_menu() {
     item "7" "禁止 IPv4 出站（iptables）"
     item "8" "撤除封堵"
     item "9" "持久化（重启后仍保持）"
-    item "10" "锁定面板走 IPv6（只改 hosts）"
-    item "11" "检查更新"
+    item "10" "锁定域名走 IPv6（可增删）"
+    item "11" "检查更新（只看）"
+    item "12" "安装更新"
     item "0" "退出"
     echo
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
     dim "想切回来：选 4 恢复 IPv4 出站"
     dim "防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9"
     echo
-    printf '  %s请选择 [0-11]: %s' "$CYN" "$RST"
+    printf '  %s请选择 [0-12]: %s' "$CYN" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -964,14 +1112,9 @@ cmd_menu() {
         pause ;;
       8) cmd_unblock; pause ;;
       9) cmd_persist on; pause ;;
-      10)
-        if ask "把面板域名锁定到 IPv6？会写入 /etc/hosts 并重启探针"; then
-          cmd_lockv6 ""
-        else
-          echo "  已取消"
-        fi
-        pause ;;
-      11) cmd_update; pause ;;
+      10) cmd_lockv6_menu; pause ;;
+      11) cmd_update check; pause ;;
+      12) cmd_update ask; pause ;;
       0) echo; exit 0 ;;
       *) echo "  无效选项"; pause ;;
     esac
@@ -992,9 +1135,14 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp unblock      撤除封堵
   kp persist      持久化，重启后仍保持 IPv6-only
   kp persist off  取消持久化
-  kp lockv6       锁定面板走 IPv6（面板域名 / PANEL 环境变量）
-  kp lockv6 off   取消锁定
-  kp update       检查更新（kp update force 跳过确认）
+  kp lockv6           域名锁定菜单（增删查）
+  kp lockv6 域名      锁定（多个用逗号分隔）
+  kp lockv6 list      列出已锁定
+  kp lockv6 rm 域名   移除指定
+  kp lockv6 off       全部移除
+  kp update       检查并提示更新（= kp update ask）
+  kp update check 只检查，不安装
+  kp update force 直接安装，不询问
   kp version      显示版本
   kp status       查看当前网络状态
   kp help         帮助
@@ -1016,8 +1164,22 @@ case "${1:-}" in
   block)     cmd_block ;;
   unblock)   cmd_unblock ;;
   persist)   cmd_persist "${2:-on}" ;;
-  lockv6)    if [ "${2:-}" = "off" ]; then cmd_lockv6_off; else cmd_lockv6 "${2:-}"; fi ;;
-  update|upgrade) cmd_update "${2:-}" ;;
+  lockv6)
+    case "${2:-}" in
+      "")        cmd_lockv6_menu ;;
+      list|ls)   cmd_lockv6_list ;;
+      off|clear) cmd_lockv6_off ;;
+      rm|del)    cmd_lockv6_rm "${3:-}" ;;
+      *)         cmd_lockv6 "$2" ;;
+    esac
+    ;;
+  update|upgrade)
+    case "${2:-ask}" in
+      check|-c|--check) cmd_update check ;;
+      force|-f|--force|yes|-y) cmd_update force ;;
+      *) cmd_update ask ;;
+    esac
+    ;;
   version|-v|--version) echo "kp $VERSION" ;;
   status)    cmd_status ;;
   help|-h|--help) usage ;;

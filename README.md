@@ -53,7 +53,8 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
    8   撤除封堵
    9   持久化（重启后仍保持）
    10  锁定面板走 IPv6（只改 hosts）
-   11  检查更新
+   11  检查更新（只看）
+   12  安装更新
    0   退出
 
   第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
@@ -81,7 +82,9 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp persist off` | 取消持久化 |
 | `kp lockv6 [域名]` | 锁定面板走 IPv6（只改 hosts，不动路由） |
 | `kp lockv6 off` | 取消锁定 |
-| `kp update` | 检查更新 |
+| `kp update` | 检查更新（有新版会询问） |
+| `kp update check` | 只检查，不安装 |
+| `kp update force` | 直接安装，不询问 |
 | `kp version` | 显示版本 |
 | `kp status` | 查看当前网络状态 |
 | `kp help` | 帮助 |
