@@ -4,7 +4,11 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
 
-当前版本：[![](https://img.shields.io/badge/version-1.3.0-blue)](kp.sh) ｜ 更新：`kp update`
+当前版本：
+
+![](https://img.shields.io/badge/version-1.4.0-blue)
+
+ ｜ 更新：`kp update`
 
 > 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会**自动识别**，也可用 `KP_PROBE=` 强制指定。
 
@@ -41,7 +45,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.3.0   ·   ONLY IPv6
+   ◆ kp 1.4.0   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐
@@ -73,12 +77,12 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 
 顶部三行是实时状态条，用彩色圆点 + 徽章显示，不用进菜单就能看到探针、上报范围和出网情况：
 
-| 符号 | 含义 |
-| --- | --- |
-| `◉` 绿 | 正常 / 运行中 |
+| 符号    | 含义              |
+| ----- | --------------- |
+| `◉` 绿 | 正常 / 运行中        |
 | `◍` 橙 | 已切断 / 已封堵（预期状态） |
-| `◎` 红 | 异常 / 未运行 |
-| `◌` 灰 | 无数据 / 未安装 |
+| `◎` 红 | 异常 / 未运行        |
+| `◌` 灰 | 无数据 / 未安装       |
 
 分隔线长度随终端宽度自适应（40~72 列），256 色终端下是渐变色，其他终端自动回落基本色。
 
@@ -88,28 +92,28 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 
 也支持非交互调用：
 
-| 命令 | 作用 |
-| --- | --- |
-| `kp` | 交互式菜单（默认） |
-| `kp check` | 探测能否纯 IPv6 存活，结束自动还原（最安全） |
-| `kp keep` | 探测后不还原，直接切到 IPv6-only |
-| `kp restore` | 恢复 IPv4 出站（切回来的路） |
-| `kp fix` | 修复 DNS（可选 `v6only` / `mixed` / `v4first`） |
-| `kp block` | iptables 硬性禁止 IPv4 出站 |
-| `kp unblock` | 撤除封堵 |
-| `kp restart` | 重启探针 |
-| `kp persist` | 持久化，重启后仍保持 IPv6-only |
-| `kp persist off` | 取消持久化 |
-| `kp nic` | 查看探针是否上报 IPv4 |
-| `kp nic off` | 不上报 IPv4（面板不再显示本机 IPv4） |
-| `kp nic on` | 恢复默认，IPv4、IPv6 都上报 |
-| `kp update` | 检查更新（有新版会询问） |
-| `kp update check` | 只检查，不安装 |
-| `kp update force` | 直接安装，不询问 |
-| `kp unlock` | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录 |
-| `kp version` | 显示版本 |
-| `kp status` | 查看当前网络状态 |
-| `kp help` | 帮助 |
+| 命令                | 作用                                        |
+| ----------------- | ----------------------------------------- |
+| `kp`              | 交互式菜单（默认）                                 |
+| `kp check`        | 探测能否纯 IPv6 存活，结束自动还原（最安全）                 |
+| `kp keep`         | 探测后不还原，直接切到 IPv6-only                     |
+| `kp restore`      | 恢复 IPv4 出站（切回来的路）                         |
+| `kp fix`          | 修复 DNS（可选 `v6only` / `mixed` / `v4first`） |
+| `kp block`        | iptables 硬性禁止 IPv4 出站                     |
+| `kp unblock`      | 撤除封堵                                      |
+| `kp restart`      | 重启探针                                      |
+| `kp persist`      | 持久化，重启后仍保持 IPv6-only                      |
+| `kp persist off`  | 取消持久化                                     |
+| `kp nic`          | 查看探针是否上报 IPv4                             |
+| `kp nic off`      | 不上报 IPv4（面板不再显示本机 IPv4）                   |
+| `kp nic on`       | 恢复默认，IPv4、IPv6 都上报                        |
+| `kp update`       | 检查更新（有新版会询问）                              |
+| `kp update check` | 只检查，不安装                                   |
+| `kp update force` | 直接安装，不询问                                  |
+| `kp unlock`       | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录          |
+| `kp version`      | 显示版本                                      |
+| `kp status`       | 查看当前网络状态                                  |
+| `kp help`         | 帮助                                        |
 
 ### 典型流程
 
@@ -119,6 +123,8 @@ kp keep                      # 切到 IPv6-only
 kp fix                       # 修 DNS（菜单里选 IPv6 优先那档）
 kp restart                   # 重启探针，让它走 IPv6
 ```
+
+
 
 > 改完 DNS 必须重启探针，多数 agent 只在启动时解析一次域名。
 
@@ -134,10 +140,10 @@ kp restore     # 恢复 IPv4 出站
 
 这是**两回事**，先分清面板上那个 IPv4 是哪来的：
 
-| 面板显示的 | 来源 | 用什么管 |
-| --- | --- | --- |
-| 连接来源 IP | 面板服务器看到的出口地址 | `kp keep` / `kp block`（改路由、防火墙） |
-| 本机网卡 IPv4 | agent 主动上报的 `ip addr` 列表 | **`kp nic off`**（改 agent 参数） |
+| 面板显示的     | 来源                       | 用什么管                            |
+| --------- | ------------------------ | ------------------------------- |
+| 连接来源 IP   | 面板服务器看到的出口地址             | `kp keep` / `kp block`（改路由、防火墙） |
+| 本机网卡 IPv4 | agent 主动上报的 `ip addr` 列表 | **`kp nic off`**（改 agent 参数）    |
 
 路由和 DNS 只影响"往外走"，管不到 agent 把网卡地址**报上去**。所以即使你切了 IPv6-only，只要 `eth0` 上还留着内网 IPv4，agent 就会把它一起上报。
 
@@ -149,10 +155,12 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 
 脚本会自动判断你装的是哪种探针，走对应的改法：
 
-| 探针 | 关掉 IPv4 上报的做法 |
-| --- | --- |
-| **Komari** | 为 `komari-agent` 写 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设 `IGNORE_IPV4=1`；OpenRC 系统写 `/etc/conf.d/komari-agent` |
-| **哪吒 v2** | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡 |
+| 探针         | 关掉 IPv4 上报的做法                                                                                                                                               |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Komari** | 为 `komari-agent` 写 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`），设 `AGENT_INCLUDE_NICS=eth1`；OpenRC 系统写 `/etc/conf.d/komari-agent` |
+| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡                                                                                         |
+
+两者思路一样：**只统计有公网 IPv6 的网卡**，内网 IPv4 自然就不进上报列表了。
 
 改完都会自动重启探针。
 
@@ -164,7 +172,23 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 kp nic on       # Komari 删掉 drop-in；哪吒删掉 nic_allowlist 段。两者都重新上报
 ```
 
-> 参数名以探针版本为准，建议先确认：`komari-agent --help | grep -i ipv4`。Komari 若你的版本用别的写法（如 `--ignore-ipv4`），改 drop-in 里那一行即可。
+> 参数名以探针版本为准，建议先确认：`komari-agent --help | grep -i nics`。
+
+### Komari 探针
+
+Komari agent 用 `include_nics` 指定**仅统计哪些网卡**（逗号分隔），对应三种等价写法：
+
+| JSON 字段        | 环境变量                 | 命令行参数            |
+| -------------- | -------------------- | ---------------- |
+| `include_nics` | `AGENT_INCLUDE_NICS` | `--include-nics` |
+
+反向的还有 `exclude_nics` / `AGENT_EXCLUDE_NICS` / `--exclude-nics`（排除指定网卡）。
+
+`kp nic off` 会自动列出本机有公网 IPv6 的网卡，写成 `AGENT_INCLUDE_NICS=eth1` 放进 drop-in。
+
+> ⚠️ **官方没有 `IGNORE_IPV4` 这类"忽略地址族"的参数**（早前版本的本脚本写过这个，是错的）。  
+> 只有网卡白名单这一条路。另有一个 `--prefer-ip-version`（`4` 或 `6`），  
+> 影响的是**出站连接**优先用哪个版本，不是上报内容，与本需求无关。
 
 ### 哪吒（Nezha）探针
 
@@ -195,6 +219,51 @@ KP_PROBE=nezha kp nic off
 >
 > 改完配置建议留意 `ip_report_period`（本机 IP 更新间隔，默认 1800 秒）——面板上的地址列表不会立刻刷新。
 
+### 改完面板还是显示 IPv4？
+
+按这个顺序排查：
+
+**1. 等一会儿，别急着下结论**
+
+上报是**定时任务**，不是改完立刻生效。Komari 基础信息默认每 **5 分钟**一次，哪吒 `ip_report_period` 默认 **1800 秒**。等过一轮再看。
+
+**2. 确认配置真的写进去了**
+
+```bash
+kp nic                                  # 看「当前过滤」那一行有没有值
+cat /etc/systemd/system/komari-agent.service.d/nic.conf   # Komari
+cat /opt/nezha/agent/config.yml                           # 哪吒
+systemctl cat komari-agent              # 看 drop-in 是否被加载
+```
+
+**3. 看 agent 进程实际拿到的参数**
+
+drop-in 写了不代表生效 —— 如果原始 service 里有 `Environment=AGENT_INCLUDE_NICS=...`，或者 agent 直接读 JSON 配置文件，**优先级会盖过 drop-in**。
+
+Komari 的配置优先级（低 → 高）：**默认值 → 命令行参数 → 环境变量 → JSON 配置文件**。
+
+```bash
+tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -i nics
+```
+
+有输出且不是你要的那张网卡，说明被别处覆盖了 —— 去改那个更高优先级的来源。
+
+**4. 确认那张网卡真的没有 IPv4**
+
+```bash
+ip -br addr show eth1
+```
+
+`include_nics` 只筛**网卡**，不筛地址族。如果 `eth1` 上同时挂着 IPv4 和 IPv6，那 IPv4 照样会被上报。
+
+**5. 面板上的 IPv4 可能来自连接来源 IP**
+
+看第一节那张表。如果是"连接来源 IP"，`kp nic` 完全管不着 —— 那得用 `kp keep` / `kp block`。
+
+**6. 刷新面板 / 清缓存**
+
+有些面板会缓存最近一次上报，清一下或重新加载页面。
+
 ---
 
 ## 注意
@@ -208,6 +277,8 @@ KP_PROBE=nezha kp nic off
 - 探针识别不准时用 `KP_PROBE=komari` 或 `KP_PROBE=nezha` 强制指定
 - 面板显示本机 IPv4 ≠ 出网没禁干净，那是探针上报的网卡地址，用 `kp nic off` 处理
 - 哪吒的 `nic_allowlist` 可能被面板下发的远程配置覆盖，面板能改就优先在面板改
+- `kp nic off` 只筛**网卡**不筛地址族：那张网卡上如果同时有 IPv4，IPv4 仍会被上报
+- 上报是定时的（Komari 约 5 分钟 / 哪吒默认 30 分钟），改完不会立刻在面板上看到变化
 
 ---
 

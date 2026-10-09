@@ -27,7 +27,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.3.0"
+VERSION="1.4.0"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -847,7 +847,7 @@ cmd_status() {
 }
 
 # ── 探针识别 ────────────────────────────────────────────
-# komari-agent 用环境变量 IGNORE_IPV4；哪吒 v2 用 YAML nic_allowlist。
+# komari-agent 用网卡白名单 include_nics；哪吒 v2 用 YAML nic_allowlist。
 # 自动识别：优先看配置文件/服务存在性，其次看进程。
 probe_kind() {
   case "$KP_PROBE" in
@@ -892,9 +892,10 @@ nezha_conf() {
 # ── 屏蔽 agent 上报 IPv4 ────────────────────────────────
 # 面板上的 IPv4 大多来自 agent 上报的「本机网卡地址列表」，
 # 跟路由/DNS/hosts 都无关——路由只影响"往外走"，管不了上报。
-# 解法：让 agent 不再上报 IPv4 地址。
-#   Komari → 环境变量 IGNORE_IPV4=1（systemd drop-in / env 文件）
-#   哪吒v2 → YAML 配置 nic_allowlist（只放行 IPv6 网卡）
+# 解法：让 agent 只统计有 IPv6 的网卡，内网 IPv4 就不进上报列表了。
+#   Komari   → include_nics / AGENT_INCLUDE_NICS / --include-nics（逗号分隔）
+#   哪吒 v2  → YAML 配置 nic_allowlist（只放行 IPv6 网卡）
+# 注：agent 官方没有 IGNORE_IPV4 这类"忽略地址族"的参数，只有网卡白名单。
 NICENVF="/etc/default/$AGENT"
 NICDROP="/etc/systemd/system/$AGENT.service.d/nic.conf"
 
@@ -906,9 +907,14 @@ has_v6() {
   [ -n "$(ip -br -6 addr show scope global 2>/dev/null)" ]
 }
 
-# 有全局 IPv6 的网卡名（哪吒 nic_allowlist 要用）
+# 有全局 IPv6 的网卡名（Komari include_nics / 哪吒 nic_allowlist 共用）
 v6_nics() {
   ip -br -6 addr show scope global 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' '
+}
+
+# 逗号分隔的形态（Komari include_nics 用）
+v6_nics_csv() {
+  v6_nics | tr -s ' ' ',' | sed -e 's/^,//' -e 's/,$//'
 }
 
 # 当前 agent 生效的过滤参数
@@ -924,12 +930,12 @@ nic_now() {
   fi
   for f in "$NICDROP" "$NICENVF" /etc/conf.d/$AGENT /etc/sysconfig/$AGENT; do
     [ -f "$f" ] || continue
-    v=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(--?(ignore|no|disable)[-_]?ipv4)|(^[[:space:]]*(IGNORE|DISABLE)_IPV4[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
+    v=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*AGENT_(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(AGENT_)?PREFER_IP_VERSION[ =]+[^ "'"'"']+)|(--prefer-ip-version[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
   done
   # 从进程命令行里现场读
   ps ax 2>/dev/null | grep -v grep \
-    | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--?(ignore|no|disable)[-_]?ipv4)' | head -1
+    | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--prefer-ip-version[= ][46])' | head -1
 }
 
 # ── 哪吒：改 YAML 的 nic_allowlist ──────────────────────
@@ -1097,18 +1103,28 @@ cmd_nic() {
     return 0
   fi
 
-  # ── Komari：走环境变量分支 ──
+  # ── Komari：走 include_nics 分支 ──
+  # 官方参数：include_nics / AGENT_INCLUDE_NICS / --include-nics（逗号分隔）
+  # 只统计有 IPv6 的网卡 → 内网 IPv4 不进上报列表。
+  NICS_CSV="$(v6_nics_csv)"
+  if [ -z "$NICS_CSV" ]; then
+    res "没有发现带公网 IPv6 的网卡" "$RED"
+    dim "include_nics 需要至少列一张要统计的网卡"
+    return 1
+  fi
+
   # 优先用 systemd drop-in，不动原始 service 文件
   if have_systemd && [ -d /etc/systemd/system ] && [ -n "$AGENT" ]; then
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
       mkdir -p "$(dirname "$NICDROP")" 2>/dev/null
       cat > "$NICDROP" <<EOF
-# kp: 让 agent 忽略 IPv4，只上报 IPv6 地址
+# kp: 只统计有 IPv6 的网卡，内网 IPv4 不再上报
 [Service]
-Environment="IGNORE_IPV4=1"
+Environment="AGENT_INCLUDE_NICS=$NICS_CSV"
 EOF
       kvp "写入 drop-in" "$NICDROP"
-      dim "IGNORE_IPV4=1"
+      kvp "仅统计网卡" "$NICS_CSV"
+      dim "AGENT_INCLUDE_NICS=$NICS_CSV"
     else
       if [ -f "$NICDROP" ]; then
         rm -f "$NICDROP"
@@ -1117,8 +1133,8 @@ EOF
       else
         kvp "drop-in" "本来就没有"
       fi
-      if [ -f "$NICENVF" ] && grep -qE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" 2>/dev/null; then
-        grep -vE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" > "$NICENVF.tmp" \
+      if [ -f "$NICENVF" ] && grep -qE '^(AGENT_)?(INCLUDE|EXCLUDE)_NICS=' "$NICENVF" 2>/dev/null; then
+        grep -vE '^(AGENT_)?(INCLUDE|EXCLUDE)_NICS=' "$NICENVF" > "$NICENVF.tmp" \
           && mv "$NICENVF.tmp" "$NICENVF"
         kvp "清理 env 文件" "$NICENVF"
       fi
@@ -1130,16 +1146,17 @@ EOF
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
       if [ -f "$CF" ]; then
         cp -a "$CF" "$CF.bak.$(date +%s)" 2>/dev/null
-        grep -vE '^(KP_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
+        grep -vE '^(AGENT_)?INCLUDE_NICS=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
       else
         printf '# kp\n' > "$CF"
       fi
-      printf 'IGNORE_IPV4=1\n' >> "$CF"
+      printf 'AGENT_INCLUDE_NICS=%s\n' "$NICS_CSV" >> "$CF"
       kvp "写入 conf.d" "$CF"
-      dim "还需让启动参数带上它，见 /etc/init.d/$AGENT"
+      kvp "仅统计网卡" "$NICS_CSV"
+      dim "还需确认 /etc/init.d/$AGENT 会把 conf.d 变量导出给进程"
     else
-      if [ -f "$CF" ] && grep -qE '^(KP_NICS|IGNORE_IPV4)=' "$CF" 2>/dev/null; then
-        grep -vE '^(KP_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+      if [ -f "$CF" ] && grep -qE '^(AGENT_)?INCLUDE_NICS=' "$CF" 2>/dev/null; then
+        grep -vE '^(AGENT_)?INCLUDE_NICS=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
         kvp "移除 conf.d 配置" "已清理"
       else
         kvp "conf.d 配置" "本来就没有"
@@ -1148,7 +1165,7 @@ EOF
   else
     res "没有 systemd 或 OpenRC" "$YEL"
     if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
-      dim "手工在启动命令里加：--ignore-ipv4"
+      dim "手工在启动命令里加：--include-nics $NICS_CSV"
       return 1
     fi
     dim "无需处理（本来就没配置过滤）"
@@ -1179,8 +1196,9 @@ EOF
                  || res "  仍有残留：$N2" "$YEL"
   fi
   echo
-  dim "参数名以 agent 版本为准，先确认：$AGENT --help | grep -i ipv4"
-  dim "若你的版本用其他写法（如 --ignore-ipv4），直接改 $NICDROP"
+  dim "参数名以 agent 版本为准，先确认：$AGENT --help | grep -i nics"
+  dim "若你的版本用其他写法，直接改 $NICDROP"
+  dim "面板不会立刻刷新：agent 基础信息默认每 5 分钟上报一次"
 }
 
 # ── 检查更新 ────────────────────────────────────────────
@@ -1550,7 +1568,7 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp help         帮助
 
 支持的探针（自动识别，也可强制指定）：
-  Komari   → IGNORE_IPV4=1，走 systemd drop-in / env 文件
+  Komari   → include_nics / AGENT_INCLUDE_NICS（只统计有 IPv6 的网卡）
   哪吒 Nezha → nic_allowlist，改 /opt/nezha/agent/config.yml
   面板上的 IPv4 来自 agent 上报的地址列表，路由/DNS 都管不了，只能改 agent 配置。
 
