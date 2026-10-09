@@ -24,7 +24,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.2.0"
+VERSION="1.3.0"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -42,23 +42,119 @@ V4B="8.8.8.8"                 # IPv4 DNS · Google（备用）
 TEST_URL="https://ifconfig.co"
 
 # ── 颜色 ────────────────────────────────────────────────
+# 优先用 256 色（更细腻），终端不支持则回落基本 16 色。
+# 判定：COLORTERM 含 truecolor/24bit，或 TERM 含 256color。
+USE256=0
 if [ -t 1 ]; then
+  case "${COLORTERM:-}:${TERM:-}" in
+    *truecolor*|*24bit*|*256color*) USE256=1 ;;
+  esac
+fi
+
+if [ -t 1 ]; then
+  # 基本属性
   RST=$(printf '\033[0m'); BOLD=$(printf '\033[1m'); DIM=$(printf '\033[2m')
+  ITAL=$(printf '\033[3m'); UNDL=$(printf '\033[4m'); BLNK=$(printf '\033[5m')
+  # 基本 16 色
   RED=$(printf '\033[31m'); GRN=$(printf '\033[32m'); YEL=$(printf '\033[33m')
-  BLU=$(printf '\033[34m'); CYN=$(printf '\033[36m'); GRA=$(printf '\033[90m')
+  BLU=$(printf '\033[34m'); MAG=$(printf '\033[35m'); CYN=$(printf '\033[36m')
+  GRY=$(printf '\033[37m'); GRA=$(printf '\033[90m')
+  BRED=$(printf '\033[91m'); BGRN=$(printf '\033[92m'); BYEL=$(printf '\033[93m')
+  BBLU=$(printf '\033[94m'); BMAG=$(printf '\033[95m'); BCYN=$(printf '\033[96m')
+  BOLD_W=$(printf '\033[1;37m')
+  BOLD_RED=$(printf '\033[1;31m'); BOLD_GRN=$(printf '\033[1;32m')
+  BOLD_YEL=$(printf '\033[1;33m'); BOLD_BLU=$(printf '\033[1;34m')
+  BOLD_MAG=$(printf '\033[1;35m'); BOLD_CYN=$(printf '\033[1;36m')
+  # 256 色扩展（有则覆盖，无则保留上面）
+  if [ "$USE256" = "1" ]; then
+    ORNG=$(printf '\033[38;5;208m');       # 橙
+    ORNG_B=$(printf '\033[1;38;5;214m');   # 亮橙
+    VIO=$(printf '\033[38;5;141m');        # 紫罗兰
+    VIO_B=$(printf '\033[1;38;5;141m')
+    TEAL=$(printf '\033[38;5;51m');        # 青
+    TEAL_B=$(printf '\033[1;38;5;45m')
+    PINK=$(printf '\033[38;5;205m');       # 粉
+    PINK_B=$(printf '\033[1;38;5;213m')
+    LIME=$(printf '\033[38;5;118m');       # 柠檬绿
+    LIME_B=$(printf '\033[1;38;5;119m')
+    SKY=$(printf '\033[38;5;117m');        # 天蓝
+    SKY_B=$(printf '\033[1;38;5;117m')
+    BORD=$(printf '\033[38;5;99m')         # 边框紫
+    BORD2=$(printf '\033[38;5;63m')        # 边框蓝紫
+  else
+    ORNG="$YEL"; ORNG_B="$BOLD_YEL"; VIO="$MAG"; VIO_B="$BOLD_MAG"
+    TEAL="$CYN"; TEAL_B="$BOLD_CYN"; PINK="$MAG"; PINK_B="$BOLD_MAG"
+    LIME="$GRN"; LIME_B="$BOLD_GRN"; SKY="$CYN"; SKY_B="$BOLD_CYN"
+    BORD="$MAG"; BORD2="$BLU"
+  fi
 else
-  RST=""; BOLD=""; DIM=""; RED=""; GRN=""; YEL=""; BLU=""; CYN=""; GRA=""
+  RST=""; BOLD=""; DIM=""; ITAL=""; UNDL=""; BLNK=""
+  RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYN=""; GRY=""; GRA=""
+  BRED=""; BGRN=""; BYEL=""; BBLU=""; BMAG=""; BCYN=""; BOLD_W=""
+  BOLD_RED=""; BOLD_GRN=""; BOLD_YEL=""; BOLD_BLU=""; BOLD_MAG=""; BOLD_CYN=""
+  ORNG=""; ORNG_B=""; VIO=""; VIO_B=""; TEAL=""; TEAL_B=""; PINK=""; PINK_B=""
+  LIME=""; LIME_B=""; SKY=""; SKY_B=""; BORD=""; BORD2=""
 fi
 
 # ── 输出小工具 ──────────────────────────────────────────
-hr()    { printf '\n%s%s──── %s ────%s\n' "$BOLD" "$CYN" "$*" "$RST"; }
-hrt()   { printf '\n%s%s──── %s ────%s %sv%s%s\n' "$BOLD" "$CYN" "$*" "$RST" "$GRA" "$VERSION" "$RST"; }
+# 分隔线长度：优先读 COLUMNS，其次 stty，最后回落 46；夹在 40~72
+TERMW="${COLUMNS:-}"
+if [ -z "$TERMW" ] || [ "$TERMW" -eq 0 ] 2>/dev/null; then
+  TERMW=$(stty size 2>/dev/null | awk '{print $2}')
+fi
+case "$TERMW" in ''|*[!0-9]*) TERMW=46 ;; esac
+[ "$TERMW" -lt 40 ] 2>/dev/null && TERMW=40
+[ "$TERMW" -gt 72 ] 2>/dev/null && TERMW=72
+
+# 用循环拼分隔线：避免 tr 在多字节字符上的编码问题
+LINE=""
+i=0
+while [ "$i" -lt "$TERMW" ]; do LINE="$LINE─"; i=$((i + 1)); done
+
+# 渐变色分隔线（256 色下更像一条彩虹）
+grad_line() {
+  if [ "$USE256" != "1" ]; then printf '%s%s%s' "$BOLD_CYN" "$LINE" "$RST"; return; fi
+  n=0; out=""
+  i=0
+  while [ "$i" -lt "$TERMW" ]; do
+    n=$(( 33 + (i * 60 / TERMW) ))       # 33 → 93，蓝到紫的渐变
+    [ "$n" -gt 231 ] && n=231
+    out="$out$(printf '\033[38;5;%sm─' "$n")"
+    i=$((i + 1))
+  done
+  printf '%s%s' "$out" "$RST"
+}
+
+hr()  { printf '\n'; grad_line; printf '\n'; \
+        printf '  %s▌%s %s%s%s\n' "$BOLD_MAG" "$RST" "$BOLD" "$*" "$RST"; }
+hrt() { printf '\n'; grad_line; printf '\n'; \
+        printf '  %s▌%s %s%s%s  %s%s%s\n' "$BOLD_MAG" "$RST" "$BOLD" "$*" "$RST" "$GRA" "$VERSION" "$RST"; }
+
 note()  { printf '  %s\n' "$*"; }
 dim()   { printf '  %s%s%s\n' "$GRA" "$*" "$RST"; }
-item()  { printf '   %s%s%s   %s\n' "$CYN$BOLD" "$1" "$RST" "$2"; }
+ok()    { printf '  %s%s%s\n' "$BGRN" "$*" "$RST"; }
+warn()  { printf '  %s%s%s\n' "$BYEL" "$*" "$RST"; }
+err()   { printf '  %s%s%s\n' "$BRED" "$*" "$RST"; }
+
+# 菜单项：序号用亮色徽章，文字渐层
+item()  { printf '   %s▸%s  %s%s%s%s   %s%s%s\n' \
+            "$PINK_B" "$RST" "$BOLD_W" "$1" "$RST" "$RST" "$GRY" "$2" "$RST"; }
+
 res()   { printf '%s%s%s\n' "$2" "$1" "$RST"; }
 
-OK="${GRN}OK${RST}"; FAIL="${RED}失败${RST}"; WARN="${YEL}注意${RST}"
+# 键值行：键右对齐到 18 列，值可带颜色
+kv()    { printf '  %s%-18s%s %s\n' "$GRA" "$1" "$RST" "$2"; }
+# 兼容旧写法：kvp = 键 + 值 + 换行；kvn = 只打印键（不换行，供后续拼接状态）
+kvp()   { printf '  %s%-18s%s %s\n' "$GRA" "$1" "$RST" "$2"; }
+kvn()   { printf '  %s%-18s%s '     "$GRA" "$1" "$RST"; }
+
+# 标题小节（带前后装饰点）
+sec()   { printf '\n   %s◆%s %s%s%s\n' "$ORNG_B" "$RST" "$BOLD" "$*" "$RST"; }
+
+# 徽章：badge 文字 颜色
+badge() { printf '%s %s %s' "$2" "$1" "$RST"; }
+
+OK="${BGRN}✔ OK${RST}"; FAIL="${BRED}✘ 失败${RST}"; WARN="${BYEL}▲ 注意${RST}"
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
@@ -153,15 +249,46 @@ EOF
 }
 
 ask() {
-  printf '  %s%s%s [y/N]: ' "$YEL" "$1" "$RST"
+  printf '  %s?%s %s%s%s %s[y/N]%s ' "$ORNG_B" "$RST" "$BOLD_W" "$1" "$RST" "$GRA" "$RST"
   read -r a || return 1
   case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
 pause() {
-  printf '\n  %s按回车返回菜单...%s' "$GRA" "$RST"
+  printf '\n  %s▸ 按回车返回菜单...%s' "$GRA" "$RST"
   read -r _ || true
   printf '\n'
+}
+
+# 轻量转圈：后台跑命令、前台转圈，命令结束即停。
+# 用法：spin "正在做某事" 命令 [参数...]
+spin() {
+  _msg="$1"; shift
+  # 非 tty 或颜色被关时退化为简单提示（避免把转义码写进日志）
+  if [ -t 1 ] && [ "$USE256" = "1" ]; then
+    "$@" >/dev/null 2>&1 &
+    _pid=$!
+    _i=0
+    while kill -0 "$_pid" 2>/dev/null; do
+      # 用 case 选帧，避免 cut 按字节切多字节字符
+      case $((_i % 10)) in
+        0) _c='⠋' ;; 1) _c='⠙' ;; 2) _c='⠹' ;; 3) _c='⠸' ;; 4) _c='⠼' ;;
+        5) _c='⠴' ;; 6) _c='⠦' ;; 7) _c='⠧' ;; 8) _c='⠇' ;; *) _c='⠏' ;;
+      esac
+      printf '\r  %s%s%s %s%s%s' "$TEAL_B" "$_c" "$RST" "$GRA" "$_msg" "$RST"
+      _i=$((_i + 1))
+      sleep 0.1
+    done
+    wait "$_pid"; _rc=$?
+    if [ "$_rc" = "0" ]; then
+      printf '\r  %s✔%s %s%s%s\n' "$BGRN" "$RST" "$GRA" "$_msg" "$RST"
+    else
+      printf '\r  %s✘%s %s%s%s\n' "$BRED" "$RST" "$GRA" "$_msg" "$RST"
+    fi
+    return $_rc
+  fi
+  printf '  %s...%s %s\n' "$GRA" "$RST" "$_msg"
+  "$@" >/dev/null 2>&1
 }
 
 # ── 探测 / 切换 ─────────────────────────────────────────
@@ -181,18 +308,18 @@ finish() {
   fi
   hr "还原"
   if [ -f "$BAK" ]; then
-    cp -a "$BAK" /etc/resolv.conf && printf '  %-22s%s\n' "resolv.conf" "已还原"
+    cp -a "$BAK" /etc/resolv.conf && kvp "resolv.conf" "已还原"
     rm -f "$BAK"
   fi
   if [ -n "$GW" ] && [ -n "$DEV" ]; then
     if ip route add default via "$GW" dev "$DEV" 2>/dev/null; then
-      printf '  %-22s%s\n' "IPv4 默认路由" "已还原 via $GW dev $DEV"
+      kvp "IPv4 默认路由" "已还原 via $GW dev $DEV"
     else
       printf '  %-22s%s%s%s\n' "IPv4 默认路由" "$RED" "还原失败" "$RST"
       dim "手动执行：ip route add default via $GW dev $DEV"
     fi
   else
-    printf '  %-22s%s\n' "IPv4 默认路由" "原本就没有，无需还原"
+    kvp "IPv4 默认路由" "原本就没有，无需还原"
   fi
 }
 
@@ -207,31 +334,31 @@ cmd_check() {
 
   hr "现状"
   if [ -n "$GW" ] || [ -n "$DEV" ]; then
-    printf '  %-22s%s\n' "IPv4 默认路由" "${GW:+via $GW }${DEV:+dev $DEV}"
+    kvp "IPv4 默认路由" "${GW:+via $GW }${DEV:+dev $DEV}"
   else
-    printf '  %-22s%s\n' "IPv4 默认路由" "无"
+    kvp "IPv4 默认路由" "无"
   fi
-  printf '  %-22s%s\n' "当前 DNS" "$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf)"
+  kvp "当前 DNS" "$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf)"
 
   hr "临时切断 IPv4 出网"
   [ -n "$GW" ] && [ -n "$DEV" ] && printf '%s %s\n' "$GW" "$DEV" > "$GWFILE"
   if [ -n "$DEV" ] && ip route del default dev "$DEV" 2>/dev/null; then
-    printf '  %-22s%s\n' "删除默认路由" "$OK（地址保留）"
+    kvp "删除默认路由" "$OK（地址保留）"
   else
-    printf '  %-22s%s\n' "删除默认路由" "$DIM跳过$RST"
+    kvp "删除默认路由" "$DIM跳过$RST"
   fi
   write_dns v6only
-  printf '  %-22s%s\n' "切换 IPv6 DNS" "$OK"
+  kvp "切换 IPv6 DNS" "$OK"
 
   hr "验证"
-  printf '  %-22s' "IPv6 连通性"
+  kvn "IPv6 连通性"
   timeout 5 ping -6 -c 1 "$D1" >/dev/null 2>&1 && res "OK" "$GRN" || res "失败" "$RED"
 
-  printf '  %-22s' "IPv6 出网"
+  kvn "IPv6 出网"
   V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
 
-  printf '  %-22s' "IPv4 出网（应失败）"
+  kvn "IPv4 出网（应失败）"
   if curl -4 -m 5 -s -o /dev/null "$TEST_URL" 2>/dev/null; then
     res "仍然可达" "$RED"
   else
@@ -239,7 +366,7 @@ cmd_check() {
   fi
 
   if [ -n "${PANEL:-}" ]; then
-    printf '  %-22s' "面板 $PANEL"
+    kvn "面板 $PANEL"
     ADDRS=$(getent ahosts "$PANEL" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
     [ -n "$ADDRS" ] && res "$ADDRS" "$CYN" || res "解析失败" "$RED"
     echo "$ADDRS" | grep -q ':' \
@@ -272,15 +399,15 @@ cmd_restore() {
       ipt_del OUTPUT -d "$LAN" -j ACCEPT
       ipt_del OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
       ipt_del OUTPUT -o lo -j ACCEPT
-      printf '  %-22s%s\n' "iptables 封堵" "已撤除"
+      kvp "iptables 封堵" "已撤除"
     else
-      printf '  %-22s%s\n' "iptables 封堵" "本来就没有"
+      kvp "iptables 封堵" "本来就没有"
     fi
   fi
 
   # 2. 恢复 IPv4 默认路由
   if [ -n "$(ip -4 route show default 2>/dev/null)" ]; then
-    printf '  %-22s%s\n' "默认路由" "已存在，无需恢复"
+    kvp "默认路由" "已存在，无需恢复"
   else
     SGW=""; SDEV=""
     if [ -f "$GWFILE" ]; then
@@ -299,7 +426,7 @@ cmd_restore() {
       [ -z "$gw" ] && continue
       ip route add default via "$gw" dev "$SDEV" 2>/dev/null || continue
       if timeout 3 ping -4 -c 1 -W 2 "$gw" >/dev/null 2>&1; then
-        printf '  %-22s%s\n' "默认路由" "已恢复 via $gw dev $SDEV"
+        kvp "默认路由" "已恢复 via $gw dev $SDEV"
         dim "来源：$( [ "$gw" = "$SGW" ] && echo 上次记录 || { [ "$gw" = "$LG" ] && echo DHCP租约 || echo 子网推测; } )"
         FOUND=yes
         break
@@ -309,23 +436,23 @@ cmd_restore() {
     done
 
     if [ "$FOUND" = "no" ]; then
-      printf '  %-22s' "默认路由"
+      kvn "默认路由"
       res "未能自动确定" "$YEL"
       dim "请直接回车跳过，或输入正确网关："
       printf '  IPv4 网关: '
       read -r UGW || true
       if [ -n "$UGW" ]; then
         if ip route add default via "$UGW" dev "$SDEV" 2>/dev/null; then
-          printf '  %-22s%s\n' "默认路由" "已恢复 via $UGW dev $SDEV"
+          kvp "默认路由" "已恢复 via $UGW dev $SDEV"
           FOUND=yes
         else
-          printf '  %-22s%s\n' "默认路由" "$FAIL"
+          kvp "默认路由" "$FAIL"
         fi
       fi
     fi
 
     if [ "$FOUND" = "no" ]; then
-      printf '  %-22s%s\n' "默认路由" "尝试重新 DHCP"
+      kvp "默认路由" "尝试重新 DHCP"
       if command -v udhcpc >/dev/null 2>&1; then
         udhcpc -i "$SDEV" -q -n -s /etc/udhcpc/default.script 2>/dev/null \
           || udhcpc -i "$SDEV" -q -n 2>/dev/null
@@ -342,26 +469,26 @@ cmd_restore() {
       fi
       sleep 3
       [ -n "$(ip -4 route show default 2>/dev/null)" ] \
-        && printf '  %-22s%s\n' "默认路由" "已通过 DHCP 恢复" \
-        || printf '  %-22s%s\n' "默认路由" "$FAIL"
+        && kvp "默认路由" "已通过 DHCP 恢复" \
+        || kvp "默认路由" "$FAIL"
     fi
   fi
 
   # 3. 还原 DNS
   RB=$(ls -t /etc/resolv.conf.bak.* 2>/dev/null | head -1)
   if [ -n "$RB" ]; then
-    cp -a "$RB" /etc/resolv.conf && printf '  %-22s%s\n' "DNS" "已从备份还原"
+    cp -a "$RB" /etc/resolv.conf && kvp "DNS" "已从备份还原"
     dim "$RB"
   else
-    printf '  %-22s%s\n' "DNS" "没有备份，保持现状"
+    kvp "DNS" "没有备份，保持现状"
   fi
 
   # 4. 验证
   hr "验证"
-  printf '  %-22s' "IPv4 出网"
+  kvn "IPv4 出网"
   V4=$(curl -4 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V4" ] && res "$V4" "$GRN" || res "仍不可达" "$RED"
-  printf '  %-22s' "IPv6 出网"
+  kvn "IPv6 出网"
   V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
 }
@@ -393,39 +520,39 @@ cmd_fix() {
   case "$MODE" in
     v6only)
       write_dns v6only
-      printf '  %-22s%s\n' "模式" "仅 IPv6"
+      kvp "模式" "仅 IPv6"
       dim "$D1 / $D2 / $D3"
       ;;
     v4first)
       write_dns v4first
-      printf '  %-22s%s\n' "模式" "IPv4 优先 + IPv6 备用"
+      kvp "模式" "IPv4 优先 + IPv6 备用"
       dim "$V4A / $V4B / $D1"
       ;;
     *)
       write_dns mixed
-      printf '  %-22s%s\n' "模式" "IPv6 优先 + IPv4 备用"
+      kvp "模式" "IPv6 优先 + IPv4 备用"
       dim "$D1 / $D2 / $V4A"
       ;;
   esac
-  printf '  %-22s%s\n' "写入" "$OK"
+  kvp "写入" "$OK"
 
   cat > /etc/resolv.conf.head <<EOF
 nameserver $D1
 nameserver $D2
 EOF
-  printf '  %-22s%s\n' "持久化" "$OK"
+  kvp "持久化" "$OK"
   dim "已写 /etc/resolv.conf.head，dhcpcd 重写时保持 IPv6 优先"
 
   hr "当前 resolv.conf"
   awk '/^nameserver|^options/{print "  " $0}' /etc/resolv.conf
 
   hr "验证"
-  printf '  %-22s' "域名解析"
+  kvn "域名解析"
   getent ahosts ifconfig.co >/dev/null 2>&1 && res "OK" "$GRN" || res "失败" "$RED"
-  printf '  %-22s' "IPv6 出网"
+  kvn "IPv6 出网"
   V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
-  printf '  %-22s' "IPv4 出网"
+  kvn "IPv4 出网"
   V4=$(curl -4 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V4" ] && res "$V4" "$GRN" || res "不可达" "$YEL"
 
@@ -436,39 +563,38 @@ EOF
 # ── 重启探针 ────────────────────────────────────────────
 cmd_restart() {
   hr "重启探针"
-  printf '  %-22s%s\n' "服务名" "$AGENT"
+  kv "服务名" "${BOLD_W}${AGENT}${RST}"
 
   if have_systemd; then
-    if systemctl restart "$AGENT" 2>/dev/null; then
-      printf '  %-22s%s\n' "重启" "$OK"
+    spin "正在重启 $AGENT" systemctl restart "$AGENT" \
+      || { err "重启失败，服务可能不存在"; dim "检查：systemctl status $AGENT"; return 1; }
+    sleep 1
+    printf '  %s%-18s%s ' "$GRA" "运行状态" "$RST"
+    if systemctl is-active "$AGENT" >/dev/null 2>&1; then
+      printf '%s' "$(st_badge "$BGRN" "运行中")"
     else
-      printf '  %-22s%s\n' "重启" "$FAIL"
-      dim "服务可能不存在，检查：systemctl status $AGENT"
-      return 1
+      printf '%s' "$(st_badge "$BRED" "未运行")"
     fi
-    sleep 2
-    printf '  %-22s' "运行状态"
-    systemctl is-active "$AGENT" >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
+    echo
     dim "看日志：journalctl -u $AGENT -f"
     return 0
 
   elif command -v rc-service >/dev/null 2>&1; then
-    if rc-service "$AGENT" restart 2>/dev/null; then
-      printf '  %-22s%s\n' "重启" "$OK"
+    spin "正在重启 $AGENT" rc-service "$AGENT" restart \
+      || { err "重启失败，服务可能不存在"; dim "检查：rc-service $AGENT status"; return 1; }
+    sleep 1
+    printf '  %s%-18s%s ' "$GRA" "运行状态" "$RST"
+    if rc-service "$AGENT" status >/dev/null 2>&1; then
+      printf '%s' "$(st_badge "$BGRN" "运行中")"
     else
-      printf '  %-22s%s\n' "重启" "$FAIL"
-      dim "服务可能不存在，检查：rc-service $AGENT status"
-      return 1
+      printf '%s' "$(st_badge "$BRED" "未运行")"
     fi
-    sleep 2
-    printf '  %-22s' "运行状态"
-    rc-service "$AGENT" status >/dev/null 2>&1 && res "运行中" "$GRN" || res "未运行" "$RED"
+    echo
     dim "看日志：tail -f /var/log/$AGENT.log"
     return 0
 
   else
-    printf '  %-22s%s\n' "服务管理器" "$FAIL"
-    dim "没找到 systemd 或 OpenRC"
+    err "没找到 systemd 或 OpenRC"
   fi
 
   # 服务方式失败时，给出可操作的排查信息
@@ -480,14 +606,14 @@ cmd_restart() {
   [ -z "$BIN" ] && BIN=$(command -v "$AGENT" 2>/dev/null)
 
   if [ -n "$BIN" ]; then
-    printf '  %-22s%s\n' "二进制" "$BIN"
-    printf '  %-22s' "进程"
+    kvp "二进制" "$BIN"
+    kvn "进程"
     ps ax 2>/dev/null | grep -v grep | grep -q "$AGENT" \
       && res "运行中" "$GRN" || res "未运行" "$RED"
     dim "没有注册成服务，手动启动："
     dim "$BIN -e https://面板域名 -t Token &"
   else
-    printf '  %-22s%s\n' "二进制" "未找到"
+    kvp "二进制" "未找到"
     dim "这台机器可能还没装 Komari 探针"
     dim "确认：ls /opt/komari/   或   ps ax | grep komari"
   fi
@@ -519,14 +645,14 @@ cmd_block() {
   ipt_add OUTPUT -p udp -m multiport --dports 67,68 -j ACCEPT
   ipt_add OUTPUT -j REJECT --reject-with icmp-net-unreachable
 
-  printf '  %-22s%s\n' "封堵规则" "$OK"
+  kvp "封堵规则" "$OK"
   dim "已放行：lo / 内网 $LAN / 已建立连接 / DHCP"
 
   hr "验证"
-  printf '  %-22s' "IPv6 出网"
+  kvn "IPv6 出网"
   V6=$(curl -6 -m 5 -s "$TEST_URL" 2>/dev/null)
   [ -n "$V6" ] && res "$V6" "$GRN" || res "失败" "$RED"
-  printf '  %-22s' "IPv4 出网"
+  kvn "IPv4 出网"
   curl -4 -m 5 -s -o /dev/null "$TEST_URL" 2>/dev/null \
     && res "仍然可达" "$RED" || res "已阻断" "$GRN"
 
@@ -550,7 +676,7 @@ cmd_unblock() {
   ipt_del OUTPUT -d "$LAN" -j ACCEPT
   ipt_del OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ipt_del OUTPUT -o lo -j ACCEPT
-  printf '  %-22s%s\n' "封堵规则" "已清除"
+  kvp "封堵规则" "已清除"
 }
 
 # ── 持久化 ──────────────────────────────────────────────
@@ -561,40 +687,40 @@ cmd_persist() {
   hr "持久化设置"
 
   if [ ! -f "$DHCPCCD" ]; then
-    printf '  %-22s%s\n' "dhcpcd.conf" "不存在，跳过"
+    kvp "dhcpcd.conf" "不存在，跳过"
   elif [ "$ACT" = "off" ]; then
     if grep -qE '^[[:space:]]*nogateway' "$DHCPCCD" 2>/dev/null; then
       cp -a "$DHCPCCD" "$DHCPCCD.bak.$(date +%s)"
       grep -vE '^[[:space:]]*nogateway' "$DHCPCCD" > "$DHCPCCD.tmp" 2>/dev/null \
         && mv "$DHCPCCD.tmp" "$DHCPCCD"
-      printf '  %-22s%s\n' "dhcpcd nogateway" "已移除"
+      kvp "dhcpcd nogateway" "已移除"
     else
-      printf '  %-22s%s\n' "dhcpcd nogateway" "本来就没有"
+      kvp "dhcpcd nogateway" "本来就没有"
     fi
   else
     if grep -qE '^[[:space:]]*nogateway' "$DHCPCCD" 2>/dev/null; then
-      printf '  %-22s%s\n' "dhcpcd nogateway" "已存在"
+      kvp "dhcpcd nogateway" "已存在"
     else
       printf '\n# kp: 不让 dhcpcd 安装 IPv4 默认网关\nnogateway\n' >> "$DHCPCCD"
-      printf '  %-22s%s\n' "dhcpcd nogateway" "已写入"
+      kvp "dhcpcd nogateway" "已写入"
       dim "续约时不会再恢复 IPv4 默认路由"
     fi
   fi
 
   if [ -f /etc/resolv.conf.head ]; then
-    printf '  %-22s%s\n' "resolv.conf.head" "已存在"
+    kvp "resolv.conf.head" "已存在"
   else
     cat > /etc/resolv.conf.head <<EOF
 nameserver $D1
 nameserver $D2
 EOF
-    printf '  %-22s%s\n' "resolv.conf.head" "已写入"
+    kvp "resolv.conf.head" "已写入"
   fi
   dim "DNS：dhcpcd 重写 resolv.conf 时会把 head 放最前，IPv6 DNS 优先"
 
   if command -v iptables >/dev/null 2>&1 && iptables -L OUTPUT -n >/dev/null 2>&1; then
     if iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable 2>/dev/null; then
-      printf '  %-22s%s\n' "iptables 规则" "需手动保存"
+      kvp "iptables 规则" "需手动保存"
       note "Debian : netfilter-persistent save"
       note "Alpine : iptables-save > /etc/iptables/rules-save"
     fi
@@ -621,7 +747,7 @@ clean_old_lockv6() {
   cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
   if grep -v "$OLDMARK" "$HOSTS" > "$HOSTS.tmp" 2>/dev/null; then
     mv "$HOSTS.tmp" "$HOSTS"
-    printf '  %-22s%s\n' "旧 hosts 锁定" "已清理（并备份）"
+    kvp "旧 hosts 锁定" "已清理（并备份）"
     restart_agent 2>/dev/null && dim "已重启 $AGENT"
   else
     rm -f "$HOSTS.tmp"
@@ -634,7 +760,7 @@ cmd_status() {
   ip -br -4 addr show scope global 2>/dev/null | awk '{print "  地址       " $3 "  (" $1 ")"}'
   R4=$(ip -4 route show default 2>/dev/null)
   if [ -n "$R4" ]; then
-    printf '  %-22s%s\n' "默认路由" "$R4"
+    kvp "默认路由" "$R4"
   else
     printf '  %-22s%s%s%s\n' "默认路由" "$YEL" "无 · IPv4 出网已切断" "$RST"
   fi
@@ -643,7 +769,7 @@ cmd_status() {
   ip -br -6 addr show scope global 2>/dev/null | awk '{print "  地址       " $3 "  (" $1 ")"}'
   R6=$(ip -6 route show default 2>/dev/null)
   if [ -n "$R6" ]; then
-    printf '  %-22s%s\n' "默认路由" "$R6"
+    kvp "默认路由" "$R6"
   else
     printf '  %-22s%s%s%s\n' "默认路由" "$RED" "无 · IPv6 出不了网，不要切换" "$RST"
   fi
@@ -656,32 +782,32 @@ cmd_status() {
     if iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable 2>/dev/null; then
       printf '  %-22s%s%s%s\n' "IPv4 出站" "$GRN" "已封堵" "$RST"
     else
-      printf '  %-22s%s\n' "IPv4 出站" "未封堵"
+      kvp "IPv4 出站" "未封堵"
     fi
   else
-    printf '  %-22s%s\n' "iptables" "不可用或无权限"
+    kvp "iptables" "不可用或无权限"
   fi
 
   hr "面板"
-  printf '  %-22s%s\n' "本机 IPv4 地址" "$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' | grep . || echo 无)"
+  kvp "本机 IPv4 地址" "$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' | grep . || echo 无)"
   if [ -n "$(nic_now)" ]; then
-    printf '  %-22s%s\n' "IPv4 上报" "已屏蔽（面板不会显示上表地址）"
+    kvp "IPv4 上报" "已屏蔽（面板不会显示上表地址）"
   else
-    printf '  %-22s%s\n' "IPv4 上报" "开启（面板会显示上表地址）"
+    kvp "IPv4 上报" "开启（面板会显示上表地址）"
     dim "想隐藏：kp nic off"
   fi
 
   hr "探针"
   case "$(probe_state)" in
-    run)  printf '  %-22s' "$AGENT"; res "运行中" "$GRN" ;;
-    stop) printf '  %-22s' "$AGENT"; res "已停止" "$RED" ;;
-    *)    printf '  %-22s' "$AGENT"; res "未安装" "$GRA" ;;
+    run)  kvn "$AGENT"; res "运行中" "$GRN" ;;
+    stop) kvn "$AGENT"; res "已停止" "$RED" ;;
+    *)    kvn "$AGENT"; res "未安装" "$GRA" ;;
   esac
   NN="$(nic_now)"
   if [ -n "$NN" ]; then
-    printf '  %-22s%s\n' "IPv4 上报" "已屏蔽（$NN）"
+    kvp "IPv4 上报" "已屏蔽（$NN）"
   else
-    printf '  %-22s%s\n' "IPv4 上报" "开启（面板会显示本机 IPv4）"
+    kvp "IPv4 上报" "开启（面板会显示本机 IPv4）"
     dim "想隐藏：kp nic off"
   fi
 }
@@ -710,7 +836,7 @@ nic_now() {
   done
   # 从进程命令行里现场读
   ps ax 2>/dev/null | grep -v grep \
-    | grep -oE '(\-\-(include|exclude)-nics[= ][^ ]+)|(\-\-?(ignore|no|disable)[-_]?ipv4)' | head -1
+    | grep -oE -- '(--(include|exclude)-nics[= ][^ ]+)|(--?(ignore|no|disable)[-_]?ipv4)' | head -1
 }
 
 cmd_nic() {
@@ -719,10 +845,10 @@ cmd_nic() {
 
   CUR="$(nic_now)"
 
-  printf '  %-22s%s\n' "服务名" "$AGENT"
-  printf '  %-22s%s\n' "本机 IPv4" "$(has_v4 && ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' || echo 无)"
-  [ -n "$CUR" ] && printf '  %-22s%s\n' "当前过滤" "$CUR" \
-                || printf '  %-22s%s\n' "当前过滤" "未设置（IPv4、IPv6 都上报）"
+  kvp "服务名" "$AGENT"
+  kvp "本机 IPv4" "$(has_v4 && ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' || echo 无)"
+  [ -n "$CUR" ] && kvp "当前过滤" "$CUR" \
+                || kvp "当前过滤" "未设置（IPv4、IPv6 都上报）"
 
   case "$ACT" in
     show|list)
@@ -754,20 +880,20 @@ cmd_nic() {
 [Service]
 Environment="IGNORE_IPV4=1"
 EOF
-      printf '  %-22s%s\n' "写入 drop-in" "$NICDROP"
+      kvp "写入 drop-in" "$NICDROP"
       dim "IGNORE_IPV4=1"
     else
       if [ -f "$NICDROP" ]; then
         rm -f "$NICDROP"
         rmdir "$(dirname "$NICDROP")" 2>/dev/null
-        printf '  %-22s%s\n' "移除 drop-in" "已删除"
+        kvp "移除 drop-in" "已删除"
       else
-        printf '  %-22s%s\n' "drop-in" "本来就没有"
+        kvp "drop-in" "本来就没有"
       fi
       if [ -f "$NICENVF" ] && grep -qE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" 2>/dev/null; then
         grep -vE '^(INCLUDE|EXCLUDE|IGNORE)_(IPV4|NICS)=' "$NICENVF" > "$NICENVF.tmp" \
           && mv "$NICENVF.tmp" "$NICENVF"
-        printf '  %-22s%s\n' "清理 env 文件" "$NICENVF"
+        kvp "清理 env 文件" "$NICENVF"
       fi
     fi
     systemctl daemon-reload 2>/dev/null && dim "已 daemon-reload"
@@ -782,14 +908,14 @@ EOF
         printf '# kp\n' > "$CF"
       fi
       printf 'IGNORE_IPV4=1\n' >> "$CF"
-      printf '  %-22s%s\n' "写入 conf.d" "$CF"
+      kvp "写入 conf.d" "$CF"
       dim "还需让启动参数带上它，见 /etc/init.d/$AGENT"
     else
       if [ -f "$CF" ] && grep -qE '^(KP_NICS|IGNORE_IPV4)=' "$CF" 2>/dev/null; then
         grep -vE '^(KP_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
-        printf '  %-22s%s\n' "移除 conf.d 配置" "已清理"
+        kvp "移除 conf.d 配置" "已清理"
       else
-        printf '  %-22s%s\n' "conf.d 配置" "本来就没有"
+        kvp "conf.d 配置" "本来就没有"
       fi
     fi
   else
@@ -805,7 +931,7 @@ EOF
   echo
   hr "重启探针"
   if restart_agent; then
-    printf '  %-22s%s\n' "$AGENT" "已重启"
+    kvp "$AGENT" "已重启"
   else
     dim "没能自动重启，请手动重启"
   fi
@@ -853,9 +979,9 @@ ver_gt() {   # $1 > $2 ?
 cmd_update() {
   MODE="${1:-ask}"
   hr "检查更新"
-  printf '  %-22s%s\n' "当前版本" "$VERSION"
+  kvp "当前版本" "$VERSION"
 
-  printf '  %-22s' "获取最新版本"
+  kvn "获取最新版本"
   NEW=$(remote_version "$RAW_URL")
   [ -z "$NEW" ] && NEW=$(remote_version "$CDN_URL")
   if [ -z "$NEW" ]; then
@@ -867,7 +993,7 @@ cmd_update() {
   res "$NEW" "$CYN"
 
   if ! ver_gt "$NEW" "$VERSION"; then
-    printf '  %-22s%s\n' "结果" "$GRN已是最新$RST"
+    kvp "结果" "$GRN已是最新$RST"
     return 0
   fi
 
@@ -888,7 +1014,7 @@ cmd_update() {
 
   # 更新前自检：能跑就留一份备份
   TMP=$(mktemp 2>/dev/null || echo "/tmp/kp.new.$$")
-  printf '  %-22s' "下载"
+  kvn "下载"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL -m 15 "$RAW_URL" -o "$TMP" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
@@ -904,7 +1030,7 @@ cmd_update() {
   fi
   res "OK" "$GRN"
 
-  printf '  %-22s' "校验"
+  kvn "校验"
   if [ "$(head -1 "$TMP" | cut -c1-9)" != "#!/bin/sh" ] || ! sh -n "$TMP" 2>/dev/null; then
     res "文件不完整或语法错误，已放弃" "$RED"
     rm -f "$TMP"
@@ -916,7 +1042,7 @@ cmd_update() {
     cp -a "$SELF" "$SELF.bak.$VERSION" 2>/dev/null
     cat "$TMP" > "$SELF" && chmod +x "$SELF"
     rm -f "$TMP"
-    printf '  %-22s%s\n' "更新" "$OK  $VERSION → $NEW"
+    kvp "更新" "$OK  $VERSION → $NEW"
     dim "旧版备份：$SELF.bak.$VERSION"
     clean_old_lockv6 2>/dev/null
     dim "重新进入菜单生效：kp"
@@ -930,11 +1056,15 @@ cmd_update() {
 
 # ── 菜单 ────────────────────────────────────────────────
 banner() {
-  printf '%s%s\n' "$CYN$BOLD" "  ┌──────────────────────────────────────┐"
-  printf '%s\n' "  │   kp · 纯 IPv6 切换 / 探针自救        │"
-  printf '%s\n' "  │   让被监控机只走 IPv6，且不泄露 IPv4  │"
-  printf '%s%s\n' "  └──────────────────────────────────────┘" "$RST"
-  printf '  %skp %s%s\n' "$GRA" "$VERSION" "$RST"
+  printf '\n'
+  printf '  %s╭──────────────────────────────────────╮%s\n' "$BORD" "$RST"
+  printf '  %s│%s  %s%s kp %s %s纯 IPv6 切换 · 探针自救%s        %s│%s\n' \
+    "$BORD" "$RST" "$BOLD_W" "$VIO_B" "$RST$BOLD_W" "$RST" "$BORD" "$RST"
+  printf '  %s│%s  %s让被监控机只走 IPv6，不泄露 IPv4%s    %s│%s\n' \
+    "$BORD" "$RST" "$GRA" "$RST" "$BORD" "$RST"
+  printf '  %s╰──────────────────────────────────────╯%s\n' "$BORD" "$RST"
+  printf '   %s◆%s %skp%s %s%s%s   %s·%s   %sONLY IPv6%s\n' \
+    "$ORNG_B" "$RST" "$GRA" "$RST" "$BOLD_W" "$VERSION" "$RST" "$GRA" "$RST" "$TEAL_B" "$RST"
 }
 
 # ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
@@ -979,48 +1109,76 @@ v6_state() {
   [ -n "$(ip -6 route show default 2>/dev/null)" ] && printf 'on' || printf 'off'
 }
 
+# 状态徽章：badge_text 前景色
+st_badge() { printf '%s▐ %s ▐%s' "$1" "$2" "$RST"; }
+
 menu_status() {
-  NSTATE="上报 IPv4+IPv6"; NCOL="$YEL"
-  [ -n "$(nic_now)" ] && { NSTATE="不上报 IPv4"; NCOL="$CYN"; }
+  # 彩色圆点
+  dot_on()  { printf '%s◉%s' "$LIME_B" "$RST"; }
+  dot_off() { printf '%s◎%s' "$BRED"   "$RST"; }
+  dot_warn(){ printf '%s◍%s' "$ORNG_B" "$RST"; }
+  dot_na()  { printf '%s◌%s' "$GRA"    "$RST"; }
 
-  # 第一行：探针运行 + 上报范围（每行都是一个完整的 printf，保证不换行错位）
-  printf '  %s  ' "探针"
+  # 打底框：用暗色竖条 + 渐变左缘
+  bar() { printf '   %s┃%s ' "$BORD" "$RST"; }
+
+  # ── 探针 ──
+  bar
+  printf '%s%s%s %s探针%s ' "$SKY_B" "◈" "$RST" "$GRA" "$RST"
   case "$(probe_state)" in
-    run)  printf '%-16s%s%s  │ %s%s\n' "$AGENT" "$GRN" "运行中" "$NCOL" "$NSTATE" ;;
-    stop) printf '%-16s%s%s  │ %s%s\n' "$AGENT" "$RED" "已停止" "$NCOL" "$NSTATE" ;;
-    *)    printf '%-16s%s%s  │ %s%s\n' "-"      "$GRA" "未安装" "$NCOL" "$NSTATE" ;;
+    run)  printf '%s ' "$(dot_on)";  printf '%s%s%s' "$BOLD_W" "$AGENT" "$RST"
+          printf ' %s' "$(st_badge "$BGRN" "运行中")" ;;
+    stop) printf '%s ' "$(dot_off)"; printf '%s%s%s' "$BOLD_W" "$AGENT" "$RST"
+          printf ' %s' "$(st_badge "$BRED" "已停止")" ;;
+    *)    printf '%s ' "$(dot_na)";  printf '%s%s%s' "$GRA"    "$AGENT" "$RST"
+          printf ' %s' "$(st_badge "$GRA" "未安装")" ;;
   esac
+  # 上报范围（右侧）
+  if [ -n "$(nic_now)" ]; then
+    printf '   %s隔离 IPv4%s' "$VIO_B" "$RST"
+  else
+    printf '   %s上报 IPv4%s' "$ORNG_B" "$RST"
+  fi
+  echo
 
-  # 第二行：IPv4 地址与出网状态
+  # ── IPv4 ──
+  bar
   A4=$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}')
   [ -z "$A4" ] && A4="n/a"
-  printf '  %s  ' "IPv4"
-  printf '%-16s' "$A4"
+  printf '%s%s%s %sIPv4%s ' "$BBLU" "◈" "$RST" "$GRA" "$RST"
   case "$(v4_state)" in
-    on)      res "│ 出网正常" "$GRN" ;;
-    off)     res "│ 出网已切断" "$YEL" ;;
-    blocked) res "│ 已封堵" "$YEL" ;;
-    *)       res "│ 状态未知" "$GRA" ;;
+    on)      printf '%s ' "$(dot_on)";   printf '%s%-17s%s' "$BOLD_W" "$A4" "$RST"
+             printf '%s' "$(st_badge "$BGRN" "出网正常")" ;;
+    off)     printf '%s ' "$(dot_warn)"; printf '%s%-17s%s' "$BOLD_W" "$A4" "$RST"
+             printf '%s' "$(st_badge "$ORNG_B" "出网已断")" ;;
+    blocked) printf '%s ' "$(dot_warn)"; printf '%s%-17s%s' "$BOLD_W" "$A4" "$RST"
+             printf '%s' "$(st_badge "$ORNG_B" "已封堵")" ;;
+    *)       printf '%s ' "$(dot_na)";   printf '%s%-17s%s' "$GRA"    "$A4" "$RST"
+             printf '%s' "$(st_badge "$GRA" "未知")" ;;
   esac
+  echo
 
-  # 第三行：IPv6 地址与出网状态
+  # ── IPv6 ──
+  bar
   A6=$(ip -br -6 addr show scope global 2>/dev/null | awk '{print $3; exit}')
   A6=${A6%%/*}
   [ -z "$A6" ] && A6="n/a"
-  [ ${#A6} -gt 16 ] && A6="$(printf '%s' "$A6" | cut -c1-15)…"
-  printf '  %s  ' "IPv6"
-  printf '%-16s' "$A6"
+  [ ${#A6} -gt 17 ] && A6="$(printf '%s' "$A6" | cut -c1-16)…"
+  printf '%s%s%s %sIPv6%s ' "$VIO_B" "◈" "$RST" "$GRA" "$RST"
   case "$(v6_state)" in
-    on)  res "│ 出网正常" "$GRN" ;;
-    off) res "│ 出网不可用" "$RED" ;;
+    on)  printf '%s ' "$(dot_on)";  printf '%s%-17s%s' "$BOLD_W" "$A6" "$RST"
+         printf '%s' "$(st_badge "$BGRN" "出网正常")" ;;
+    off) printf '%s ' "$(dot_off)"; printf '%s%-17s%s' "$BOLD_W" "$A6" "$RST"
+         printf '%s' "$(st_badge "$BRED" "出网不可用")" ;;
   esac
+  echo
 }
 
 # ── 二级菜单：切换出网模式 ──────────────────────────────
 cmd_switch_mode() {
   hr "切换出网模式"
   if [ -n "$(ip -4 route show default 2>/dev/null)" ]; then
-    printf '  %-22s%s\n' "当前模式" "IPv4 + IPv6 都通"
+    kvp "当前模式" "IPv4 + IPv6 都通"
     echo
     dim "切到 IPv6-only 后，IPv4 将无法访问公网"
     dim "内网与已建立的 SSH 连接不受影响"
@@ -1031,7 +1189,7 @@ cmd_switch_mode() {
       echo "  已取消"
     fi
   else
-    printf '  %-22s%s\n' "当前模式" "IPv6-only（IPv4 出网已切断）"
+    kvp "当前模式" "IPv6-only（IPv4 出网已切断）"
     echo
     if ask "恢复 IPv4 出站？"; then
       cmd_restore
@@ -1046,7 +1204,7 @@ cmd_fire_menu() {
   hr "IPv4 出站封堵"
   if command -v iptables >/dev/null 2>&1 \
      && iptables -C OUTPUT -j REJECT --reject-with icmp-net-unreachable >/dev/null 2>&1; then
-    printf '  %-22s%s\n' "当前状态" "已封堵"
+    kvp "当前状态" "已封堵"
     echo
     if ask "撤除封堵？"; then
       cmd_unblock
@@ -1054,7 +1212,7 @@ cmd_fire_menu() {
       echo "  已取消"
     fi
   else
-    printf '  %-22s%s\n' "当前状态" "未封堵"
+    kvp "当前状态" "未封堵"
     echo
     dim "封堵比删默认路由更硬，但也依赖 iptables 权限"
     echo
@@ -1070,7 +1228,7 @@ cmd_fire_menu() {
 cmd_nic_menu() {
   hr "面板显示的本机 IPv4"
   if [ -n "$(nic_now)" ]; then
-    printf '  %-22s%s\n' "当前状态" "已屏蔽（agent 不上报 IPv4）"
+    kvp "当前状态" "已屏蔽（agent 不上报 IPv4）"
     echo
     if ask "恢复上报 IPv4？"; then
       cmd_nic on
@@ -1078,7 +1236,7 @@ cmd_nic_menu() {
       echo "  已取消"
     fi
   else
-    printf '  %-22s%s\n' "当前状态" "未屏蔽（面板会显示本机 IPv4）"
+    kvp "当前状态" "未屏蔽（面板会显示本机 IPv4）"
     echo
     dim "面板上的 IPv4 来自 agent 上报的网卡地址，不是出口 IP"
     dim "屏蔽后 agent 只上报 IPv6，面板不再显示本机 IPv4"
@@ -1098,22 +1256,28 @@ cmd_menu() {
     echo
     menu_status
     echo
+    printf '   %s┄┄%s %s%s查看与切换%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$SKY_B" "$RST" "$BORD" "$RST"
     item "1" "查看当前状态"
     item "2" "探测能否纯 IPv6（自动还原）"
     item "3" "切换出网模式（IPv6-only ⇄ 恢复 IPv4）"
+    echo
+    printf '   %s┄┄%s %s%s修复与维护%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$ORNG_B" "$RST" "$BORD" "$RST"
     item "4" "修复 DNS（IPv6 + IPv4 可选）"
     item "5" "重启探针"
     item "6" "IPv4 出站封堵（iptables 开/关）"
     item "7" "屏蔽面板显示的本机 IPv4"
     item "8" "持久化（重启后仍保持）"
+    echo
+    printf '   %s┄┄%s %s%s其他%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$VIO_B" "$RST" "$BORD" "$RST"
     item "9" "检查更新"
     item "0" "退出"
     echo
+    printf '  %s┈┈┈%s %s提示%s %s┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈%s\n' "$BORD2" "$RST" "$PINK_B" "$RST" "$BORD2" "$RST"
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
     dim "面板显示本机 IPv4：选 7（路由管不了 agent 上报）"
     dim "防止 dhcpcd 续约把 IPv4 装回来：切完记得选 8"
     echo
-    printf '  %s请选择 [0-9]: %s' "$CYN" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-9]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -1126,8 +1290,8 @@ cmd_menu() {
       7) cmd_nic_menu; pause ;;
       8) cmd_persist on; pause ;;
       9) cmd_update ask; pause ;;
-      0) echo; exit 0 ;;
-      *) echo "  无效选项"; pause ;;
+      0) printf '\n  %s再见 👋%s\n\n' "$TEAL_B" "$RST"; exit 0 ;;
+      *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
   done
 }
