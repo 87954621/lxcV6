@@ -27,7 +27,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.4.1"
+VERSION="1.5.0"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -164,24 +164,94 @@ badge() { printf '%s %s %s' "$2" "$1" "$RST"; }
 OK="${BGRN}✔ OK${RST}"; FAIL="${BRED}✘ 失败${RST}"; WARN="${BYEL}▲ 注意${RST}"
 
 # 判断本机能不能用 systemd 管服务。
-# 容器（incus / LXC）里 /run/systemd/system 常常不存在，但 systemctl 是可用的，
-# 所以不能只看那个目录 —— 三重判定：pid 1 是 systemd / 目录存在 / systemctl 真能用。
+# 容器（incus / LXC）里 /run/systemd/system 常常不存在，
+# 有些精简镜像甚至没有 journalctl，所以不能只看目录或命令存在性 ——
+# 必须真正确认 systemd 是活的（pid 1 是 systemd，或 systemctl 能列出单元）。
 have_systemd() {
   command -v systemctl >/dev/null 2>&1 || return 1
-  [ -d /run/systemd/system ] && return 0
-  # 容器里 pid 1 也可能不是 systemd，但 systemctl 仍能通过 dbus 操作宿主的 systemd
+  # pid 1 是 systemd 最可靠
   if [ -r /proc/1/comm ] && grep -q '^systemd' /proc/1/comm 2>/dev/null; then
     return 0
   fi
-  # 最后手段：直接问 systemctl 能不能列出单元（能列出说明 systemd 真的可用）
+  [ -d /run/systemd/system ] && return 0
+  # 兜底：能列出单元说明 systemd 真的在跑（无 journalctl 也不影响这个）
   systemctl list-units >/dev/null 2>&1 && return 0
   return 1
+}
+
+# 本机实际在用的 init 系统：systemd / openrc / sysvinit / none
+init_kind() {
+  if have_systemd; then printf 'systemd'; return; fi
+  if [ -d /run/openrc ] || [ -e /sbin/openrc ] || command -v rc-service >/dev/null 2>&1; then
+    printf 'openrc'; return
+  fi
+  if [ -d /etc/init.d ] && [ -n "$(ls /etc/init.d 2>/dev/null)" ]; then
+    printf 'sysvinit'; return
+  fi
+  printf 'none'
 }
 
 # 探针服务名：Komari 用 AGENT（默认 komari-agent）；
 # 哪吒的单元名固定是 nezha-agent，不用靠 AGENT 猜。
 unit_name() {
   if [ "$(probe_kind)" = "nezha" ]; then printf 'nezha-agent'; else printf '%s' "$AGENT"; fi
+}
+
+# 探针是否被某个服务管理器接管（有 unit / init 脚本）
+agent_managed() {
+  u="$(unit_name)"
+  if have_systemd; then
+    for n in "$u" "$AGENT"; do
+      systemctl cat "$n" >/dev/null 2>&1 && return 0
+    done
+  fi
+  [ -f "/etc/init.d/$u" ] && return 0
+  [ -f "/etc/init.d/$AGENT" ] && return 0
+  return 1
+}
+
+# 探针主进程的 PID（按实际命令行匹配，不依赖服务名）
+agent_pid() {
+  pidof "$(unit_name)" 2>/dev/null | awk '{print $1}' && return 0
+  pgrep -f "$(unit_name)" 2>/dev/null | head -1 && return 0
+  pgrep -f "$AGENT" 2>/dev/null | head -1
+}
+
+# 探针是不是被 supervise-daemon 拉起来的（Alpine/OpenRC 常见）
+# 特征：进程列表里同时有 supervise-daemon 和探针二进制
+agent_supervised() {
+  ps ax 2>/dev/null | grep -v grep | grep -q 'supervise-daemon'
+}
+
+# init 脚本路径（OpenRC 的 /etc/init.d/<svc>）
+init_script() {
+  u="$(unit_name)"
+  for f in "/etc/init.d/$u" "/etc/init.d/$AGENT"; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  printf ''
+}
+
+# init 脚本里是否把 conf.d 的变量导出给进程（export / set -a）
+init_exports_env() {
+  s="$(init_script)"
+  [ -z "$s" ] && return 1
+  grep -qE '(^|[^#])\b(export|set -a)\b' "$s" 2>/dev/null
+}
+
+# 探针二进制的真实路径（从进程命令行里抠，最准）
+agent_bin() {
+  B=""
+  P="$(agent_pid)"
+  if [ -n "$P" ] && [ -r "/proc/$P/cmdline" ]; then
+    B=$(tr '\0' ' ' < "/proc/$P/cmdline" 2>/dev/null | awk '{print $1}')
+    [ -x "$B" ] && { printf '%s' "$B"; return 0; }
+  fi
+  for p in /opt/komari/agent /opt/komari/komari-agent /usr/local/bin/komari-agent \
+           /opt/nezha/agent/nezha-agent /usr/local/bin/nezha-agent; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  printf ''
 }
 
 # 重启探针：先按识别的服务名，再逐个回落到常见候选名。
@@ -903,13 +973,15 @@ nezha_conf() {
 }
 
 # ── 屏蔽 agent 上报 IPv4 ────────────────────────────────
-# 面板上的 IPv4 大多来自 agent 上报的「本机网卡地址列表」，
-# 跟路由/DNS/hosts 都无关——路由只影响"往外走"，管不了上报。
-# 解法：让 agent 只统计有 IPv6 的网卡，内网 IPv4 就不进上报列表了。
-#   Komari   → include_nics / AGENT_INCLUDE_NICS / --include-nics（逗号分隔）
-#   哪吒 v2  → YAML 配置 nic_allowlist（只放行 IPv6 网卡）
+# 面板上的 IPv4 大多来自 agent 上报，两个可能来源：
+#   1. 出口公网 IP —— agent 向 api.ipify.org 等外部 API 查出来的
+#   2. 本机网卡地址 —— agent 读 ip addr 得到的
+# Komari agent **默认走第 1 条**（get_ip_addr_from_nic 默认 false），
+# 所以必须同时开两个开关才能让它只上报 IPv6 网卡、不上报 IPv4：
+#   AGENT_GET_IP_ADDR_FROM_NIC=true   切到"从网卡取 IP"
+#   AGENT_INCLUDE_NICS=eth1           白名单只留没有 IPv4 的网卡
+# 哪吒 v2 用 YAML 的 nic_allowlist，语义相同。
 # 注：agent 官方没有 IGNORE_IPV4 这类"忽略地址族"的参数，只有网卡白名单。
-NICENVF="/etc/default/$AGENT"
 NICDROP="/etc/systemd/system/$AGENT.service.d/nic.conf"
 
 # 本机是否有 IPv4（用来提示"其实已经没有了"）
@@ -946,7 +1018,11 @@ nic_now() {
     fi
     return 0
   fi
-  for f in "$NICDROP" "$NICENVF" /etc/conf.d/$AGENT /etc/sysconfig/$AGENT; do
+  # 依次查：systemd drop-in / OpenRC conf.d / sysv 默认文件 / env 文件 / init 脚本
+  # init 脚本要一起查 —— OpenRC(docker/incus) 场景下参数是直接注入那里的
+  for f in "$NICDROP" /etc/conf.d/$AGENT /etc/default/$AGENT \
+           /etc/sysconfig/$AGENT "/etc/${AGENT}.env" "$(init_script)"; do
+    [ -n "$f" ] || continue
     [ -f "$f" ] || continue
     # 必须同时看到「从网卡取 IP」开关，否则 include_nics 是空转（agent 不读网卡）
     nics=$(grep -h -oE '(--(include|exclude)-nics[ =]+[^ "'"'"']+)|(^[[:space:]]*AGENT_(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)|(^[[:space:]]*(INCLUDE|EXCLUDE)_NICS[ =]+[^ "'"'"']+)' "$f" 2>/dev/null | head -1)
@@ -1147,8 +1223,16 @@ cmd_nic() {
   fi
 
   # 优先用 systemd drop-in，不动原始 service 文件
-  if have_systemd && [ -d /etc/systemd/system ] && [ -n "$AGENT" ]; then
-    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
+  KIND_INIT="$(init_kind)"
+  kvp "init 系统" "$KIND_INIT"
+  OFFACT=yes
+  case "$ACT" in
+    on|all|showall|include) OFFACT=no ;;
+  esac
+
+  if [ "$KIND_INIT" = "systemd" ] && [ -d /etc/systemd/system ] && [ -n "$AGENT" ]; then
+    # ── systemd：写 drop-in（但不影响非 systemd 管起来的进程）──
+    if [ "$OFFACT" = "yes" ]; then
       mkdir -p "$(dirname "$NICDROP")" 2>/dev/null
       cat > "$NICDROP" <<EOF
 # kp: 让 agent 改从网卡取 IP，且只取有 IPv6 的网卡 → 不上报 IPv4
@@ -1168,44 +1252,144 @@ EOF
       else
         kvp "drop-in" "本来就没有"
       fi
-      if [ -f "$NICENVF" ] && grep -qE '^(AGENT_)?(INCLUDE|EXCLUDE|GET_IP_ADDR_FROM)_?(NICS|NIC)=' "$NICENVF" 2>/dev/null; then
-        grep -vE '^(AGENT_)?(INCLUDE|EXCLUDE|GET_IP_ADDR_FROM)_?(NICS|NIC)=' "$NICENVF" > "$NICENVF.tmp" \
-          && mv "$NICENVF.tmp" "$NICENVF"
-        kvp "清理 env 文件" "$NICENVF"
-      fi
     fi
     systemctl daemon-reload 2>/dev/null && dim "已 daemon-reload"
-  elif command -v rc-service >/dev/null 2>&1; then
-    # OpenRC：写进 /etc/conf.d/<service>
+  fi
+
+  # ── OpenRC：conf.d 只是"变量仓库"，进程吃不吃得到取决于 init 脚本 ──
+  # Alpine/OpenRC 的 supervise-daemon 场景里，conf.d 的变量**不会自动进进程**，
+  # 所以这里直接查 init 脚本有没有 export —— 没有就不能只靠 conf.d。
+  if [ "$KIND_INIT" = "openrc" ]; then
     CF="/etc/conf.d/$AGENT"
-    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
+    if [ "$OFFACT" = "yes" ]; then
       if [ -f "$CF" ]; then
         cp -a "$CF" "$CF.bak.$(date +%s)" 2>/dev/null
-        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
+        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC|EXCLUDE_NICS|IGNORE_IPV4)=' "$CF" > "$CF.tmp" 2>/dev/null && mv "$CF.tmp" "$CF"
       else
         printf '# kp\n' > "$CF"
       fi
       printf 'AGENT_GET_IP_ADDR_FROM_NIC=true\n' >> "$CF"
       printf 'AGENT_INCLUDE_NICS=%s\n' "$NICS_CSV" >> "$CF"
       kvp "写入 conf.d" "$CF"
+
+      # 关键判断：init 脚本会不会把 conf.d 导出给进程
+      if init_exports_env; then
+        kvp "init 脚本" "$(init_script)（会 export，conf.d 生效）"
+      else
+        IS="$(init_script)"
+        if [ -n "$IS" ]; then
+          kvp "init 脚本" "$IS"
+          warn "该脚本没有 export conf.d 的变量，进程吃不到"
+          # 直接把参数写进 start_pre / command_args 这类"真正传给进程"的行。
+          # OpenRC 的写法通常是把参数放在变量里：
+          #   command_args="..."
+          #   supervise_daemon_args="... -- 参数"
+          #   start_pre() { ... }
+          # 所以往下找这些变量行，在值末尾追加参数。
+          if ! grep -q 'kp-nic-args' "$IS" 2>/dev/null; then
+            cp -a "$IS" "$IS.kp.bak.$(date +%s)" 2>/dev/null
+            awk -v extra=" --get-ip-addr-from-nic --include-nics $NICS_CSV" '
+              BEGIN { done = 0 }
+              # 优先 command_args（这是真正传给探针二进制的参数）
+              /^[[:space:]]*command_args=/ && !done {
+                line = $0
+                sub(/["'\'']$/, extra "&", line)
+                print line "   # kp-nic-args"
+                done = 1
+                next
+              }
+              { print }
+              END { if (!done) exit 3 }
+            ' "$IS" > "$IS.tmp" 2>/dev/null
+            if [ $? = 0 ] && grep -q 'kp-nic-args' "$IS.tmp" 2>/dev/null; then
+              mv "$IS.tmp" "$IS"
+              chmod +x "$IS" 2>/dev/null
+              kvp "注入启动参数" "--get-ip-addr-from-nic --include-nics $NICS_CSV"
+              dim "已写进 $IS 的 command_args 行"
+            else
+              rm -f "$IS.tmp"
+              warn "初始化脚本结构特殊，没法自动改"
+              dim "请手动编辑 $IS，在传给探针的参数里加："
+              dim "--get-ip-addr-from-nic --include-nics $NICS_CSV"
+            fi
+          else
+            kvp "启动参数" "已注入过（含 kp-nic-args 标记）"
+          fi
+        else
+          warn "找不到 /etc/init.d/$AGENT，无法自动注入启动参数"
+        fi
+      fi
       kvp "仅统计网卡" "$NICS_CSV"
-      dim "还需确认 /etc/init.d/$AGENT 会把 conf.d 变量导出给进程"
     else
-      if [ -f "$CF" ] && grep -qE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" 2>/dev/null; then
-        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
+      if [ -f "$CF" ] && grep -qE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC|IGNORE_IPV4)=' "$CF" 2>/dev/null; then
+        grep -vE '^(AGENT_)?(INCLUDE_NICS|GET_IP_ADDR_FROM_NIC|IGNORE_IPV4)=' "$CF" > "$CF.tmp" && mv "$CF.tmp" "$CF"
         kvp "移除 conf.d 配置" "已清理"
       else
         kvp "conf.d 配置" "本来就没有"
       fi
+      # 同步撤掉注入的启动参数
+      IS="$(init_script)"
+      if [ -n "$IS" ] && grep -q 'kp-nic-args' "$IS" 2>/dev/null; then
+        cp -a "$IS" "$IS.kp.bak.$(date +%s)" 2>/dev/null
+        awk '
+          /kp-nic-args/ {
+            sub(/ *--get-ip-addr-from-nic/, "")
+            sub(/ *--include-nics [^ "]*/, "")
+            sub(/ *# kp-nic-args/, "")
+            sub(/ *= *""/, "")
+          }
+          { print }
+        ' "$IS" > "$IS.tmp" 2>/dev/null && mv "$IS.tmp" "$IS"
+        chmod +x "$IS" 2>/dev/null
+        kvp "撤销启动参数" "$IS"
+      fi
     fi
-  else
-    res "没有 systemd 或 OpenRC" "$YEL"
-    if [ "$ACT" != "on" ] && [ "$ACT" != "all" ] && [ "$ACT" != "showall" ] && [ "$ACT" != "include" ]; then
-      dim "手工在启动命令里加：--get-ip-addr-from-nic --include-nics $NICS_CSV"
-      return 1
+  fi
+
+  # ── 兜底：脚本自己启动的场景，或没有服务管理器 ──
+  # 写一个 env 文件 + 包一层启动脚本，保证变量一定进得去。
+  # 同时处理"进程是裸跑、没被任何 init 接管"的情况。
+  if [ "$KIND_INIT" = "none" ] || [ "$KIND_INIT" = "sysvinit" ] || ! agent_managed; then
+    ENVF="/etc/${AGENT}.env"
+    if [ "$OFFACT" = "yes" ]; then
+      cat > "$ENVF" <<EOF
+# kp: 探针环境变量（由 kp nic off 生成）
+AGENT_GET_IP_ADDR_FROM_NIC=true
+AGENT_INCLUDE_NICS=$NICS_CSV
+EOF
+      kvp "写入 env 文件" "$ENVF"
+      # 生成启动包装，方便用户手动拉起时带上变量
+      WRAP="/usr/local/bin/${AGENT}-start"
+      if [ ! -f "$WRAP" ]; then
+        BIN=""
+        for p in /opt/komari/komari-agent /usr/local/bin/komari-agent /usr/bin/komari-agent; do
+          [ -x "$p" ] && BIN="$p" && break
+        done
+        if [ -n "$BIN" ]; then
+          {
+            printf '#!/bin/sh\n'
+            printf '# kp 生成：带环境变量启动探针\n'
+            printf 'set -a; . %s; set +a\n' "$ENVF"
+            printf 'exec %s "$@"\n' "$BIN"
+          } > "$WRAP"
+          chmod +x "$WRAP"
+          kvp "写入启动包装" "$WRAP"
+        fi
+      fi
+      dim "这个环境没有 systemd/OpenRC 接管探针"
+      dim "变量已写入 $ENVF"
+      if [ -n "${BIN:-}" ]; then
+        dim "用包装脚本重启：$WRAP &"
+      fi
+    else
+      rm -f "$ENVF"
+      kvp "清理 env 文件" "$ENVF"
     fi
-    dim "无需处理（本来就没配置过滤）"
-    return 0
+  elif [ "$KIND_INIT" = "systemd" ] || [ "$KIND_INIT" = "openrc" ]; then
+    # 被 init 接管：顺手清掉可能的裸跑残留
+    if [ "$OFFACT" = "no" ] && [ -f "/etc/${AGENT}.env" ]; then
+      rm -f "/etc/${AGENT}.env"
+    fi
   fi
 
   echo

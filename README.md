@@ -6,7 +6,7 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 当前版本：
 
-![](https://img.shields.io/badge/version-1.4.1-blue)
+![](https://img.shields.io/badge/version-1.5.0-blue)
 
  ｜ 更新：`kp update`
 
@@ -45,7 +45,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.4.0   ·   ONLY IPv6
+   ◆ kp 1.5.0   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐
@@ -157,7 +157,7 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 
 | 探针         | 关掉 IPv4 上报的做法                                                                                                                                                                                        |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Komari** | 两个环境变量**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=<有 IPv6 的网卡>`，写进 systemd drop-in（`/etc/systemd/system/komari-agent.service.d/nic.conf`）；OpenRC 写 `/etc/conf.d/komari-agent` |
+| **Komari** | 两个参数**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=<有 IPv6 的网卡>`。systemd 写 drop-in；OpenRC 写 `/etc/conf.d/komari-agent`，若 init 脚本不 export 则**直接注入启动参数** |
 | **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡                                                                                                                                   |
 
 改完都会自动重启探针。
@@ -167,7 +167,32 @@ kp nic off      # 让探针忽略 IPv4，只上报 IPv6
 恢复默认：
 
 ```bash
-kp nic on       # Komari 删掉 drop-in；哪吒删掉 nic_allowlist 段。两者都重新上报
+kp nic on       # Komari 删掉 drop-in/conf.d 并撤销注入的参数；哪吒删掉 nic_allowlist 段
+```
+
+### OpenRC / Alpine 的坑（写 conf.d 不一定生效）
+
+Alpine / OpenRC 上，`/etc/conf.d/<svc>` 只是**变量仓库** —— 变量能不能进到进程，
+取决于 `/etc/init.d/<svc>` 脚本有没有 `export` 或 `set -a`。
+
+用 `supervise-daemon` 拉起的探针（`ps -ef` 里能看到 `supervise-daemon komari-agent ...`）
+**通常不会自动继承 conf.d 的变量**，所以只写 conf.d 往往无效。
+
+`kp nic off` 会自动判断：
+
+1. 先查 `/etc/init.d/<svc>` 有没有 `export` / `set -a`
+2. **有** → 写 conf.d 就够了
+3. **没有** → 直接把 `--get-ip-addr-from-nic --include-nics eth1` 注入到 init 脚本的
+   `command_args=` 行尾（带 `# kp-nic-args` 标记，便于 `kp nic on` 精确撤销）
+
+怎么确认是否生效：
+
+```bash
+# 看进程实际拿到的参数（最直接）
+ps -ef | grep -v grep | grep komari
+
+# 看环境变量有没有进去
+tr '\0' '\n' < /proc/$(pgrep -f 'komari|agent' | head -1)/environ | grep -iE 'nic|IP_ADDR'
 ```
 
 ### Komari 探针（重要）
