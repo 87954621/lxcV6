@@ -4,7 +4,7 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
 
-![](https://img.shields.io/badge/version-1.6.1-blue) ｜ 更新：`kp update`
+![](https://img.shields.io/badge/version-1.6.2-blue) ｜ 更新：`kp update`
 
 > 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会自动识别，也可用 `KP_PROBE=` 强制指定。
 
@@ -39,7 +39,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.6.1   ·   ONLY IPv6
+   ◆ kp 1.6.2   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐

@@ -29,7 +29,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.6.1"
+VERSION="1.6.2"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -214,9 +214,17 @@ agent_managed() {
 
 # 探针主进程的 PID（按实际命令行匹配，不依赖服务名）
 agent_pid() {
-  pidof "$(unit_name)" 2>/dev/null | awk '{print $1}' && return 0
-  pgrep -f "$(unit_name)" 2>/dev/null | head -1 && return 0
-  pgrep -f "$AGENT" 2>/dev/null | head -1
+  U="$(unit_name)"
+  P=""
+  # 依次尝试：服务名 → 进程名关键字
+  for pat in "$U" "$AGENT"; do
+    [ -n "$pat" ] || continue
+    P="$(pidof "$pat" 2>/dev/null | awk '{print $1}')"
+    [ -n "$P" ] && { printf '%s' "$P"; return 0; }
+    P="$(pgrep -f "$pat" 2>/dev/null | head -1)"
+    [ -n "$P" ] && { printf '%s' "$P"; return 0; }
+  done
+  return 1
 }
 
 # 探针是不是被 supervise-daemon 拉起来的（Alpine/OpenRC 常见）
@@ -269,7 +277,15 @@ restart_agent() {
   if command -v rc-service >/dev/null 2>&1; then
     for u in "$U" "$AGENT" komari-agent nezha-agent; do
       [ -n "$u" ] || continue
-      rc-service "$u" restart >/dev/null 2>&1 && return 0
+      # OpenRC 下服务名可能不带 -agent 后缀，两种都试
+      case "$u" in
+        *-agent) _alt="${u%-agent}" ;;
+        *)       _alt="$u-agent" ;;
+      esac
+      for n in "$u" "$_alt"; do
+        [ -n "$n" ] || continue
+        rc-service "$n" restart >/dev/null 2>&1 && return 0
+      done
     done
   fi
   if command -v service >/dev/null 2>&1; then
@@ -277,6 +293,13 @@ restart_agent() {
       [ -n "$u" ] || continue
       service "$u" restart >/dev/null 2>&1 && return 0
     done
+  fi
+  # 兜底：supervise-daemon 拉起的进程，上面都没成功时直接杀进程让它自动拉起
+  if agent_supervised; then
+    P="$(agent_pid 2>/dev/null)"
+    if [ -n "$P" ]; then
+      kill "$P" 2>/dev/null && return 0
+    fi
   fi
   return 1
 }
@@ -708,6 +731,7 @@ cmd_restart() {
 
   # 服务方式失败时，给出可操作的排查信息
   hr "排查"
+  BIN=""
   BIN=""
   if [ "$(probe_kind)" = "nezha" ]; then
     for p in /opt/nezha/agent/nezha-agent /usr/local/bin/nezha-agent /usr/bin/nezha-agent; do
@@ -1896,6 +1920,7 @@ cmd_nic_menu() {
     dim "面板上的 IPv4 来自 agent 上报的网卡地址，不是出口 IP"
     dim "屏蔽后 agent 只上报 IPv6，面板不再显示本机 IPv4"
     echo
+    V4=""; V6O=""
     if [ "$(probe_kind)" = "komari" ]; then
       V4="$(v4_nics_csv)"
       V6O="$(v6_nics_csv)"
