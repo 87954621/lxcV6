@@ -21,6 +21,12 @@
 
 set -u
 
+# ── 版本与更新源 ────────────────────────────────────────
+VERSION="1.0.0"
+SELF="${0:-kp}"
+RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
+CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
+
 # ── 配置区 ──────────────────────────────────────────────
 LAN="10.10.0.0/22"
 AGENT="komari-agent"
@@ -586,6 +592,123 @@ EOF
   fi
 }
 
+# ── 锁定面板走 IPv6 ─────────────────────────────────────
+HOSTS="/etc/hosts"
+MARK="# kp-panel"
+
+hosts_domain() {
+  awk -v m="$MARK" '$0 ~ m {print $2; exit}' "$HOSTS" 2>/dev/null
+}
+
+# 取面板域名：参数 → 已有标记 → 从探针服务里解析 → 询问
+panel_domain() {
+  if [ -n "${1:-}" ]; then printf '%s' "$1"; return 0; fi
+  [ -n "${PANEL:-}" ] && { printf '%s' "$PANEL"; return 0; }
+
+  d=$(hosts_domain)
+  [ -n "$d" ] && { printf '%s' "$d"; return 0; }
+
+  # 从 service 单元的 ExecStart / command_args 里抠 -e 后面的地址
+  for f in /etc/systemd/system/$AGENT.service /etc/init.d/$AGENT; do
+    [ -f "$f" ] || continue
+    u=$(grep -oE '(-e|--endpoint)[= ]+(https?://)?[^ "'"'"'\\]+' "$f" 2>/dev/null \
+        | head -1 | sed -E 's/^(-e|--endpoint)[= ]+//; s#^https?://##; s#/.*$##')
+    [ -n "$u" ] && { printf '%s' "$u"; return 0; }
+  done
+
+  if [ -t 0 ]; then
+    printf '  面板域名（从探针配置里没找到）: ' >&2
+    read -r u || true
+    printf '%s' "$u"
+  fi
+}
+
+cmd_lockv6() {
+  hr "锁定面板走 IPv6"
+  D=$(panel_domain "${1:-}")
+  if [ -z "$D" ]; then
+    res "拿不到面板域名" "$RED"
+    dim "用法：kp lockv6 面板域名"
+    dim "或先设置：PANEL=面板域名 kp lockv6"
+    return 1
+  fi
+  printf '  %-22s%s\n' "面板域名" "$D"
+
+  # 解析 AAAA
+  A6=$(getent ahostsv6 "$D" 2>/dev/null | awk '{print $1}' | grep ':' | head -1)
+  if [ -z "$A6" ]; then
+    res "该域名没有 AAAA 记录" "$RED"
+    dim "纯 IPv6 下无法连接。请给域名加 AAAA，或改用 kp block 全局封堵"
+    return 1
+  fi
+  printf '  %-22s%s\n' "IPv6 地址" "$A6"
+
+  A4=$(getent ahostsv4 "$D" 2>/dev/null | awk '{print $1; exit}')
+  if [ -n "$A4" ]; then
+    printf '  %-22s%s\n' "IPv4 地址" "$A4"
+    dim "将通过 hosts 屏蔽，避免探针走它"
+  fi
+
+  # 写入 /etc/hosts
+  if [ -f "$HOSTS" ]; then
+    cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
+    if grep -q "$MARK" "$HOSTS" 2>/dev/null; then
+      grep -v "$MARK" "$HOSTS" > "$HOSTS.tmp" && mv "$HOSTS.tmp" "$HOSTS"
+      dim "已替换原有 kp 记录"
+    fi
+    printf '%s %s %s\n' "$A6" "$D" "$MARK" >> "$HOSTS"
+    printf '  %-22s%s\n' "写入 /etc/hosts" "$OK"
+    dim "$A6 $D"
+  else
+    res "/etc/hosts 不存在" "$RED"
+    return 1
+  fi
+
+  # 有些解析器会直接读 hosts，但进程多半已缓存
+  hr "重启探针"
+  if restart_agent; then
+    printf '  %-22s%s\n' "$AGENT" "$OK"
+  else
+    dim "没找到 $AGENT 服务，请手动重启"
+  fi
+
+  hr "验证"
+  printf '  %-22s' "域名解析"
+  RN=$(getent ahosts "$D" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+  if echo "$RN" | grep -q ':'; then
+    res "$RN" "$GRN"
+    if echo "$RN" | grep -qE '(^| )[0-9]+\.'; then
+      dim "注意：仍返回了 IPv4 地址，探针可能还会尝试走它"
+    else
+      dim "只返回 IPv6，符合预期"
+    fi
+  else
+    res "$RN" "$YEL"
+  fi
+
+  printf '  %-22s' "IPv6 可达"
+  curl -6 -m 5 -s -o /dev/null -w '%{http_code}' "https://$D" 2>/dev/null | grep -qE '^[1-5]' \
+    && res "OK" "$GRN" || res "无响应" "$YEL"
+
+  dim "撤销：kp lockv6 off"
+}
+
+cmd_lockv6_off() {
+  hr "取消面板锁定"
+  if [ ! -f "$HOSTS" ]; then
+    dim "/etc/hosts 不存在"
+    return 0
+  fi
+  if grep -q "$MARK" "$HOSTS" 2>/dev/null; then
+    cp -a "$HOSTS" "$HOSTS.kp.bak.$(date +%s)" 2>/dev/null
+    grep -v "$MARK" "$HOSTS" > "$HOSTS.tmp" && mv "$HOSTS.tmp" "$HOSTS"
+    printf '  %-22s%s\n' "已移除 kp 记录" "$OK"
+    restart_agent 2>/dev/null && dim "已重启 $AGENT"
+  else
+    printf '  %-22s%s\n' "k p 记录" "本来就没有"
+  fi
+}
+
 # ── 状态 ────────────────────────────────────────────────
 cmd_status() {
   hr "IPv4"
@@ -620,6 +743,16 @@ cmd_status() {
     printf '  %-22s%s\n' "iptables" "不可用或无权限"
   fi
 
+  hr "面板"
+  HD=$(hosts_domain)
+  if [ -n "$HD" ]; then
+    HA=$(awk -v m="$MARK" '$0 ~ m {print $1; exit}' "$HOSTS" 2>/dev/null)
+    printf '  %-22s%s\n' "$HD" "已锁定到 $HA"
+    dim "撤销：kp lockv6 off"
+  else
+    printf '  %-22s%s\n' "未锁定" "探针按系统解析结果选路"
+  fi
+
   hr "探针"
   if have_systemd; then
     printf '  %-22s' "$AGENT"
@@ -632,11 +765,95 @@ cmd_status() {
   fi
 }
 
+# ── 检查更新 ────────────────────────────────────────────
+fetch_url() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -m 10 "$1" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- -T 10 "$1" 2>/dev/null
+  elif command -v busybox >/dev/null 2>&1; then
+    busybox wget -qO- "$1" 2>/dev/null
+  fi
+}
+
+remote_version() {
+  fetch_url "$1" | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1
+}
+
+ver_gt() {   # $1 > $2 ?
+  [ "$1" = "$2" ] && return 1
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$1" ]
+}
+
+cmd_update() {
+  hr "检查更新"
+  printf '  %-22s%s\n' "当前版本" "$VERSION"
+
+  printf '  %-22s' "获取最新版本"
+  NEW=$(remote_version "$RAW_URL")
+  [ -z "$NEW" ] && NEW=$(remote_version "$CDN_URL")
+  if [ -z "$NEW" ]; then
+    res "失败" "$RED"
+    dim "网络不通，或仓库地址有变"
+    dim "手动更新：wget -qO $SELF $RAW_URL && chmod +x $SELF"
+    return 1
+  fi
+  res "$NEW" "$CYN"
+
+  if ! ver_gt "$NEW" "$VERSION"; then
+    printf '  %-22s%s\n' "结果" "$GRN已是最新$RST"
+    return 0
+  fi
+
+  echo
+  if [ "${1:-}" != "force" ] && ! ask "有新版本，现在更新？"; then
+    echo "  已取消"
+    return 0
+  fi
+
+  # 更新前自检：能跑就留一份备份
+  TMP=$(mktemp 2>/dev/null || echo "/tmp/kp.new.$$")
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -m 15 "$RAW_URL" -o "$TMP" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$TMP" "$RAW_URL" 2>/dev/null
+  fi
+
+  if [ ! -s "$TMP" ]; then
+    res "下载失败" "$RED"
+    rm -f "$TMP"
+    return 1
+  fi
+
+  printf '  %-22s' "校验"
+  if [ "$(head -1 "$TMP" | cut -c1-9)" != "#!/bin/sh" ] || ! sh -n "$TMP" 2>/dev/null; then
+    res "文件不完整或语法错误，已放弃" "$RED"
+    rm -f "$TMP"
+    return 1
+  fi
+  res "OK" "$GRN"
+
+  if [ -w "$(dirname "$SELF")" ] || [ "$(id -u)" = "0" ]; then
+    cp -a "$SELF" "$SELF.bak.$VERSION" 2>/dev/null
+    cat "$TMP" > "$SELF" && chmod +x "$SELF"
+    rm -f "$TMP"
+    printf '  %-22s%s\n' "更新" "$OK  $VERSION → $NEW"
+    dim "旧版备份：$SELF.bak.$VERSION"
+    dim "重新进入菜单生效：kp"
+  else
+    res "没有写入权限" "$YEL"
+    dim "手动执行：wget -qO $SELF $RAW_URL && chmod +x $SELF"
+    rm -f "$TMP"
+    return 1
+  fi
+}
+
 # ── 菜单 ────────────────────────────────────────────────
 banner() {
   printf '%s%s\n' "$CYN$BOLD" "  ┌────────────────────────────────┐"
   printf '%s\n' "  │  kp · 纯 IPv6 切换工具         │"
   printf '%s%s\n' "  └────────────────────────────────┘" "$RST"
+  printf '  %sv%s%s\n' "$GRA" "$VERSION" "$RST"
 }
 
 # ── 菜单顶部状态条（只读路由表与防火墙，不做网络探测，瞬间返回）──
@@ -714,13 +931,15 @@ cmd_menu() {
     item "7" "禁止 IPv4 出站（iptables）"
     item "8" "撤除封堵"
     item "9" "持久化（重启后仍保持）"
+    item "10" "锁定面板走 IPv6（只改 hosts）"
+    item "11" "检查更新"
     item "0" "退出"
     echo
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
     dim "想切回来：选 4 恢复 IPv4 出站"
     dim "防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9"
     echo
-    printf '  %s请选择 [0-9]: %s' "$CYN" "$RST"
+    printf '  %s请选择 [0-11]: %s' "$CYN" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -745,6 +964,14 @@ cmd_menu() {
         pause ;;
       8) cmd_unblock; pause ;;
       9) cmd_persist on; pause ;;
+      10)
+        if ask "把面板域名锁定到 IPv6？会写入 /etc/hosts 并重启探针"; then
+          cmd_lockv6 ""
+        else
+          echo "  已取消"
+        fi
+        pause ;;
+      11) cmd_update; pause ;;
       0) echo; exit 0 ;;
       *) echo "  无效选项"; pause ;;
     esac
@@ -765,6 +992,10 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp unblock      撤除封堵
   kp persist      持久化，重启后仍保持 IPv6-only
   kp persist off  取消持久化
+  kp lockv6       锁定面板走 IPv6（面板域名 / PANEL 环境变量）
+  kp lockv6 off   取消锁定
+  kp update       检查更新（kp update force 跳过确认）
+  kp version      显示版本
   kp status       查看当前网络状态
   kp help         帮助
 
@@ -785,6 +1016,9 @@ case "${1:-}" in
   block)     cmd_block ;;
   unblock)   cmd_unblock ;;
   persist)   cmd_persist "${2:-on}" ;;
+  lockv6)    if [ "${2:-}" = "off" ]; then cmd_lockv6_off; else cmd_lockv6 "${2:-}"; fi ;;
+  update|upgrade) cmd_update "${2:-}" ;;
+  version|-v|--version) echo "kp $VERSION" ;;
   status)    cmd_status ;;
   help|-h|--help) usage ;;
   *) echo "未知子命令: $1"; echo; usage; exit 1 ;;

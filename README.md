@@ -2,6 +2,8 @@
 
 VPS 纯 IPv6 切换脚本，配合 Komari 探针使用。
 
+当前版本：[![](https://img.shields.io/badge/version-1.0.0-blue)](kp.sh) ｜ 更新：`kp update`
+
 > 前置：机器已安装 Komari 探针。
 
 ---
@@ -49,10 +51,14 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
    6   重启探针
    7   禁止 IPv4 出站（iptables）
    8   撤除封堵
+   9   持久化（重启后仍保持）
+   10  锁定面板走 IPv6（只改 hosts）
+   11  检查更新
    0   退出
 
   第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
   想切回来：选 4 恢复 IPv4 出站
+  防止 dhcpcd 续约把 IPv4 路由装回来：切完记得选 9
 ```
 
 顶部三行是实时状态，不用进菜单就能看到探针和出网情况。
@@ -71,6 +77,12 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 | `kp block` | iptables 硬性禁止 IPv4 出站 |
 | `kp unblock` | 撤除封堵 |
 | `kp restart` | 重启探针 |
+| `kp persist` | 持久化，重启后仍保持 IPv6-only |
+| `kp persist off` | 取消持久化 |
+| `kp lockv6 [域名]` | 锁定面板走 IPv6（只改 hosts，不动路由） |
+| `kp lockv6 off` | 取消锁定 |
+| `kp update` | 检查更新 |
+| `kp version` | 显示版本 |
 | `kp status` | 查看当前网络状态 |
 | `kp help` | 帮助 |
 
@@ -93,10 +105,29 @@ kp restart     # 重启探针（自动识别 systemd / OpenRC）
 kp restore     # 恢复 IPv4 出站
 ```
 
+### 只让面板走 IPv6（推荐，最轻量）
+
+不想全局禁 IPv4，只希望探针走 IPv6 —— 选菜单 10，或：
+
+```bash
+kp lockv6 你的面板域名
+```
+
+它会查该域名的 AAAA 记录，写进 `/etc/hosts` 并重启探针。**不动路由、不动 DNS、不影响其他 IPv4 访问**，因此也不会有「续约后恢复」的问题。
+
+撤销：
+
+```bash
+kp lockv6 off
+```
+
+> 前提：面板域名有 AAAA 记录，且 IPv6 地址相对稳定。套 Cloudflare 的域名 IP 会变，不适合这种方式。
+
 ---
 
 ## 注意
 
+- **切换是运行时改动，dhcpcd 续约（约 28 分钟）或重启后 IPv4 默认路由会自动装回来** —— 要长期保持请选菜单 9 或跑 `kp persist`
 - 动手前确认有服务商的 VNC / 控制台，并确保 `ssh -6` 能连进来
 - `kp block` 需要 `NET_ADMIN` 权限，容器里没有的话用 `kp keep`
 - 脚本改的是运行时状态，重启失效；要持久化在 `/etc/dhcpcd.conf` 加 `nogateway`
