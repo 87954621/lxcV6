@@ -4,19 +4,13 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
 
-当前版本：
+![](https://img.shields.io/badge/version-1.6.1-blue) ｜ 更新：`kp update`
 
-![](https://img.shields.io/badge/version-1.6.0-blue)
-
- ｜ 更新：`kp update`
-
-> 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会**自动识别**，也可用 `KP_PROBE=` 强制指定。
+> 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会自动识别，也可用 `KP_PROBE=` 强制指定。
 
 ---
 
 ## 安装
-
-装完自动进入菜单：
 
 ```bash
 wget -qO /usr/local/bin/kp https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh && chmod +x /usr/local/bin/kp && kp
@@ -38,14 +32,14 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 
 ## 使用
 
-直接敲 `kp` 进入菜单，按数字选：
+直接敲 `kp` 进菜单，按数字选：
 
 ```
   ╭──────────────────────────────────────╮
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.6.0   ·   ONLY IPv6
+   ◆ kp 1.6.1   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐
@@ -66,292 +60,138 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
    ┄┄ 其他 ┄┄
    ▸  9   检查更新
    ▸  0   退出
-
-  ┈┈┈ 提示 ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
-  第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换
-  面板显示本机 IPv4：选 7（路由管不了 agent 上报）
-  防止 dhcpcd 续约把 IPv4 装回来：切完记得选 8
-
-  ❯ 请选择 [0-9] :
 ```
 
-顶部三行是实时状态条，用彩色圆点 + 徽章显示，不用进菜单就能看到探针、上报范围和出网情况：
-
-| 符号    | 含义              |
-| ----- | --------------- |
-| `◉` 绿 | 正常 / 运行中        |
-| `◍` 橙 | 已切断 / 已封堵（预期状态） |
-| `◎` 红 | 异常 / 未运行        |
-| `◌` 灰 | 无数据 / 未安装       |
-
-分隔线长度随终端宽度自适应（40~72 列），256 色终端下是渐变色，其他终端自动回落基本色。
-
-菜单项 3、6、7 是**开关式**的：进去后先显示当前状态，再问你要不要切到另一边，同一个入口管开也管关。
-
-危险操作都会先问一次 `y/N` 再执行。
-
-也支持非交互调用：
-
-| 命令                | 作用                                        |
-| ----------------- | ----------------------------------------- |
-| `kp`              | 交互式菜单（默认）                                 |
-| `kp check`        | 探测能否纯 IPv6 存活，结束自动还原（最安全）                 |
-| `kp keep`         | 探测后不还原，直接切到 IPv6-only                     |
-| `kp restore`      | 恢复 IPv4 出站（切回来的路）                         |
-| `kp fix`          | 修复 DNS（可选 `v6only` / `mixed` / `v4first`） |
-| `kp block`        | iptables 硬性禁止 IPv4 出站                     |
-| `kp unblock`      | 撤除封堵                                      |
-| `kp restart`      | 重启探针                                      |
-| `kp persist`      | 持久化，重启后仍保持 IPv6-only                      |
-| `kp persist off`  | 取消持久化                                     |
-| `kp nic`          | 查看探针是否上报 IPv4                             |
-| `kp nic off`      | 不上报 IPv4（面板不再显示本机 IPv4）；默认排除法            |
-| `kp nic off --include` | 改用白名单：只统计纯 IPv6 网卡                      |
-| `kp nic on`       | 恢复默认，IPv4、IPv6 都上报                        |
-| `kp update`       | 检查更新（有新版会询问）                              |
-| `kp update check` | 只检查，不安装                                   |
-| `kp update force` | 直接安装，不询问                                  |
-| `kp unlock`       | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录          |
-| `kp version`      | 显示版本                                      |
-| `kp status`       | 查看当前网络状态                                  |
-| `kp help`         | 帮助                                        |
+菜单项 3、6、7 是**开关式**的：进去先显示当前状态，再问你要不要切到另一边。危险操作都会先问一次 `y/N`。
 
 ### 典型流程
 
 ```bash
 PANEL=你的面板域名 kp check   # 先探测，看完结论再决定
 kp keep                      # 切到 IPv6-only
-kp fix                       # 修 DNS（菜单里选 IPv6 优先那档）
+kp fix                       # 修 DNS（选 IPv6 优先那档）
 kp restart                   # 重启探针，让它走 IPv6
 ```
 
-
-
 > 改完 DNS 必须重启探针，多数 agent 只在启动时解析一次域名。
 
-### 常用
+### 非交互调用
 
-```bash
-kp status      # 看状态
-kp restart     # 重启探针（自动识别 systemd / OpenRC）
-kp restore     # 恢复 IPv4 出站
-```
+| 命令 | 作用 |
+| --- | --- |
+| `kp` | 交互式菜单（默认） |
+| `kp check` | 探测能否纯 IPv6 存活，结束自动还原（最安全） |
+| `kp keep` | 探测后不还原，直接切到 IPv6-only |
+| `kp restore` | 恢复 IPv4 出站 |
+| `kp fix` | 修复 DNS（可选 `v6only` / `mixed` / `v4first`） |
+| `kp block` / `kp unblock` | iptables 硬性禁止 / 撤除 IPv4 出站 |
+| `kp restart` | 重启探针 |
+| `kp persist` / `kp persist off` | 持久化 / 取消持久化 |
+| `kp nic` | 查看探针是否上报 IPv4 |
+| `kp nic off` | 不上报 IPv4（默认白名单） |
+| `kp nic on` | 恢复默认，IPv4、IPv6 都上报 |
+| `kp update` | 检查更新（`check` 只查 / `force` 直接装） |
+| `kp status` | 查看当前网络状态 |
+| `kp unlock` | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录 |
+| `kp version` / `kp help` | 版本 / 帮助 |
 
-### 面板里还是能看到本机 IPv4？
+---
 
-这是**两回事**，先分清面板上那个 IPv4 是哪来的：
+## 面板里还是能看到本机 IPv4？
 
-| 面板显示的     | 来源                       | 用什么管                            |
-| --------- | ------------------------ | ------------------------------- |
-| 连接来源 IP   | 面板服务器看到的出口地址             | `kp keep` / `kp block`（改路由、防火墙） |
-| 本机网卡 IPv4 | agent 主动上报的 `ip addr` 列表 | **`kp nic off`**（改 agent 参数）    |
+先分清面板上那个 IPv4 是哪来的：
 
-路由和 DNS 只影响"往外走"，管不到 agent 把网卡地址**报上去**。所以即使你切了 IPv6-only，只要 `eth0` 上还留着内网 IPv4，agent 就会把它一起上报。
+| 面板显示的 | 来源 | 用什么管 |
+| --- | --- | --- |
+| 连接来源 IP | 面板服务器看到的出口地址 | `kp keep` / `kp block`（改路由、防火墙） |
+| 本机网卡 IPv4 | agent 主动上报的 `ip addr` 列表 | **`kp nic off`**（改 agent 参数） |
+
+路由和 DNS 只影响"往外走"，管不到 agent 把网卡地址**报上去**。所以即使切了 IPv6-only，只要 `eth0` 上还留着内网 IPv4，agent 就会一起上报。
 
 **选菜单 7，或：**
 
 ```bash
-kp nic off              # 默认排除法：排除带 IPv4 的网卡（其余照常统计）
-kp nic off --include    # 改用白名单：只统计纯 IPv6 网卡
+kp nic off      # 让探针不上报 IPv4
+kp nic on       # 恢复默认
 ```
 
-脚本会自动判断你装的是哪种探针，走对应的改法：
-
-| 探针 | 关掉 IPv4 上报的做法 |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Komari** | 两个参数**缺一不可**：`AGENT_GET_IP_ADDR_FROM_NIC=true` + 网卡过滤。默认 `AGENT_EXCLUDE_NICS=<带 IPv4 的网卡>`（排除法）；加 `--include` 则用 `AGENT_INCLUDE_NICS=<只有 IPv6 的网卡>`。systemd 写 drop-in；OpenRC 写 `/etc/conf.d/komari-agent`，若 init 脚本不 export 则**直接注入启动参数** |
-| **哪吒 v2**  | 改 `/opt/nezha/agent/config.yml`，写入 `nic_allowlist`，只放行有 IPv6 的那几张网卡 |
-
-改完都会自动重启探针。
-
-> 为什么默认排除法：机器上常见"只有一张双栈网卡"的情况，纯 v6 网卡一张都挑不出来，
-> 白名单直接无解；排除法只要有一张带 v4 的网卡就能用。
+脚本自动判断探针种类，并自动挑出该统计/该排除的网卡，改完自动重启探针。
 
 > 操作前会检查本机有没有全局 IPv6，没有就拒绝执行（否则可能彻底失联）。
+>
+> **上报是定时的**（Komari 约 5 分钟 / 哪吒默认 30 分钟），改完不会立刻在面板上看到变化，等一轮再看。
 
-恢复默认：
+### 两种方式
 
-```bash
-kp nic on       # Komari 删掉 drop-in/conf.d 并撤销注入的参数；哪吒删掉 nic_allowlist 段
-```
-
-### OpenRC / Alpine 的坑（写 conf.d 不一定生效）
-
-Alpine / OpenRC 上，`/etc/conf.d/<svc>` 只是**变量仓库** —— 变量能不能进到进程，
-取决于 `/etc/init.d/<svc>` 脚本有没有 `export` 或 `set -a`。
-
-用 `supervise-daemon` 拉起的探针（`ps -ef` 里能看到 `supervise-daemon komari-agent ...`）
-**通常不会自动继承 conf.d 的变量**，所以只写 conf.d 往往无效。
-
-`kp nic off` 会自动判断：
-
-1. 先查 `/etc/init.d/<svc>` 有没有 `export` / `set -a`
-2. **有** → 写 conf.d 就够了
-3. **没有** → 直接把 `--get-ip-addr-from-nic --exclude-nics eth0` 注入到 init 脚本的
-   `command_args=` 行尾（带 `# kp-nic-args` 标记，便于 `kp nic on` 精确撤销）
-
-怎么确认是否生效：
+默认用**白名单**：只统计**没有 IPv4** 的网卡。
 
 ```bash
-# 看进程实际拿到的参数（最直接）
-ps -ef | grep -v grep | grep komari
-
-# 看环境变量有没有进去
-tr '\0' '\n' < /proc/$(pgrep -f 'komari|agent' | head -1)/environ | grep -iE 'nic|IP_ADDR'
+kp nic off            # 白名单（默认）：只统计纯 IPv6 网卡，如 eth1
+kp nic off --exclude  # 排除法：排掉带 IPv4 的网卡，其余照常统计
 ```
 
-### Komari 探针（重要）
+白名单最精确 —— 被统计的网卡上压根没有 IPv4。但如果机器上所有网卡都是双栈（挑不出纯 v6 网卡），就用 `--exclude`。
 
-**Komari agent 默认压根不读网卡** —— 它是向 `api.ipify.org` 之类的外部 API 查**出口公网 IP**，
-查到什么报什么。所以**单设网卡过滤完全没用**，这是个很容易踩的坑。
+> 原理：Komari agent 默认向外部 API 查**出口公网 IP** 上报，不读网卡。
+> 所以要同时开「从网卡取 IP」+ 网卡过滤，两个缺一不可：
+>
+> ```ini
+> AGENT_GET_IP_ADDR_FROM_NIC=true
+> AGENT_INCLUDE_NICS=eth1      # 白名单；排除法则用 AGENT_EXCLUDE_NICS=eth0
+> ```
+>
+> 这样取到的 IPv4 为空 → 上报空值 → 面板不再显示 IPv4。
 
-官方 README 里没列、但源码里真实存在的关键参数（`cmd/flags/flag.go`）：
+### 哪吒 v2
 
-| JSON 字段                    | 环境变量                            | 说明                    |
-| ------------------------- | ------------------------------- | --------------------- |
-| `get_ip_addr_from_nic`    | `AGENT_GET_IP_ADDR_FROM_NIC`    | **从网卡获取 IP**（默认 `false`） |
-| `custom_ipv4`             | `AGENT_CUSTOM_IPV4`             | 自定义 IPv4 地址           |
-| `custom_ipv6`             | `AGENT_CUSTOM_IPV6`             | 自定义 IPv6 地址           |
-| `include_nics`            | `AGENT_INCLUDE_NICS`            | 仅统计指定网卡，逗号分隔          |
-| `exclude_nics`            | `AGENT_EXCLUDE_NICS`            | 排除指定网卡，逗号分隔           |
-
-源码逻辑（`monitoring/unit/ip.go` 的 `GetIPAddress()`）：
-
-```
-if get_ip_addr_from_nic {            ← 默认 false，直接跳过
-    遍历网卡，按 include_nics / exclude_nics 过滤
-    if 取到了 { 返回 }
-}
-从外部 API 查出口 IP                 ← 默认走这条
-```
-
-所以正确的组合是**两个一起开**（两种过滤方式任选其一）：
-
-**方式 A：排除法（`kp nic off` 默认）**
-
-```ini
-[Service]
-Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
-Environment="AGENT_EXCLUDE_NICS=eth0"
-```
-
-把**带 IPv4 的网卡排除掉**，其余网卡照常统计。适合 `eth0` 双栈（v4+v6）、`eth1` 纯 v6 这类情况 —— 排掉 `eth0` 后 agent 只从 `eth1` 取 IPv6。
-
-**方式 B：白名单（`kp nic off --include`）**
-
-```ini
-[Service]
-Environment="AGENT_GET_IP_ADDR_FROM_NIC=true"
-Environment="AGENT_INCLUDE_NICS=eth1"
-```
-
-只遍历白名单里的 `eth1`，要求 `eth1` 上**只有 IPv6、没有 IPv4**。
-
-两种方式的共同点：改成从网卡取 IP 后，取到的 IPv4 为空 → **上报空值 → 面板不再显示 IPv4**。
-
-> 为什么默认用排除法？因为机器上常见的情况是"只有一张双栈网卡"，
-> 这时一个纯 v6 网卡都挑不出来，白名单直接无解；排除法只要有一张带 v4 的网卡就能用。
-
-> ⚠️ 早前版本的本脚本写过 `IGNORE_IPV4`，**那个参数根本不存在**（我编的），
-> 所以那时怎么改都"没有效果"。现在已改为上面这组真实参数。
-
-### 哪吒（Nezha）探针
-
-哪吒 v2 的 agent 用 YAML 里的 `nic_allowlist` 决定**监控哪些网卡**，不写就是全部监控：
+改 `/opt/nezha/agent/config.yml`，`nic_allowlist` 里**只列出要监控的网卡**：
 
 ```yaml
-# /opt/nezha/agent/config.yml
 nic_allowlist:
-  eth0: true
-  eth1: false
+  eth1: true     # 只监控 eth1；没列出来的网卡本来就不监控
 ```
 
-`kp nic off` 会自动列出本机有公网 IPv6 的网卡，写成 `: true`，其余网卡不列（等于不监控），内网 IPv4 就不会再出现在面板上。
+> 面板支持下发远程配置，会覆盖本机文件。面板能改就优先在面板改。
 
-识别规则（从上往下，命中即停）：
-
-1. 存在 `/opt/nezha/agent/config.yml` 或 `/etc/nezha/config.yml`
-2. 有 `nezha-agent` 的 systemd 单元或 `/etc/init.d/nezha-agent`
-3. 进程列表里有 `nezha-agent`
-
-识别不出来时，用环境变量强制指定：
+### 识别不准时
 
 ```bash
-KP_PROBE=nezha kp nic off
+KP_PROBE=nezha kp nic off     # 强制按哪吒处理
+KP_PROBE=komari kp nic off    # 强制按 Komari 处理
 ```
 
-> ⚠️ 哪吒面板支持**下发远程配置**，如果面板侧也配了 `nic_allowlist`，通常会覆盖本机文件。面板能改的话，优先在面板改更稳妥。
->
-> 改完配置建议留意 `ip_report_period`（本机 IP 更新间隔，默认 1800 秒）——面板上的地址列表不会立刻刷新。
-
-### 改完面板还是显示 IPv4？
-
-按这个顺序排查：
-
-**1. 等一会儿，别急着下结论**
-
-上报是**定时任务**，不是改完立刻生效。Komari 基础信息默认每 **5 分钟**一次，哪吒 `ip_report_period` 默认 **1800 秒**。等过一轮再看。
-
-**2. 确认配置真的写进去了**
+### 生效了吗？
 
 ```bash
-kp nic                                  # 看「当前过滤」那一行有没有值
-cat /etc/systemd/system/komari-agent.service.d/nic.conf   # Komari
-cat /opt/nezha/agent/config.yml                           # 哪吒
-systemctl cat komari-agent              # 看 drop-in 是否被加载
+kp nic                                        # 看「当前过滤」那行
+ps -ef | grep -v grep | grep -E 'komari|nezha'  # 看进程实际参数
 ```
 
-**3. 看 agent 进程实际拿到的参数**
+期望看到 `--get-ip-addr-from-nic --include-nics eth1`（或 `--exclude-nics eth0`）。
 
-drop-in 写了不代表生效 —— 如果原始 service 里有 `Environment=AGENT_INCLUDE_NICS=...`，或者 agent 直接读 JSON 配置文件，**优先级会盖过 drop-in**。
+---
 
-Komari 的配置优先级（低 → 高）：**默认值 → 命令行参数 → 环境变量 → JSON 配置文件**。
+## 环境变量
 
-```bash
-tr '\0' '\n' < /proc/$(pgrep -f komari-agent | head -1)/environ | grep -iE 'nic|IP_ADDR'
-```
-
-**两个变量都要看到**，且是对应的那一对：
-
-- 排除法（默认）：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_EXCLUDE_NICS=eth0`
-- 白名单：`AGENT_GET_IP_ADDR_FROM_NIC=true` + `AGENT_INCLUDE_NICS=eth1`
-
-少了前者，agent 就会继续走外部 API 查出口 IP，网卡过滤等于空转。
-
-**4. 确认过滤规则选对了**
-
-```bash
-ip -br addr show eth0     # 带 IPv4 的网卡 → 应该出现在 EXCLUDE_NICS 里
-ip -br addr show eth1     # 纯 IPv6 的网卡 → 用白名单时才放 INCLUDE_NICS
-```
-
-如果用白名单，而那张网卡上同时挂着 IPv4 和 IPv6，IPv4 照样会被取到并上报 ——
-这时改用 `kp nic off`（排除法）把带 IPv4 的网卡排掉。
-
-**5. 面板上的 IPv4 可能来自连接来源 IP**
-
-看第一节那张表。如果是"连接来源 IP"，`kp nic` 完全管不着 —— 那得用 `kp keep` / `kp block`。
-
-**6. 刷新面板 / 清缓存**
-
-有些面板会缓存最近一次上报，清一下或重新加载页面。
+| 变量 | 说明 |
+| --- | --- |
+| `PANEL=面板域名` | 额外检查面板域名能否解析出 AAAA |
+| `KP_PROBE=komari\|nezha` | 强制指定探针种类（默认 auto） |
+| `KP_AGENT=服务名` | 探针服务名不是 `komari-agent` 时指定 |
+| `KP_LAN=网段` | 内网网段不是 `10.10.0.0/22` 时指定 |
+| `KP_PROC=进程名` | 探针进程名匹配关键字（默认 komari / nezha） |
 
 ---
 
 ## 注意
 
-- **切换是运行时改动，dhcpcd 续约（约 28 分钟）或重启后 IPv4 默认路由会自动装回来** —— 要长期保持请选菜单 8 或跑 `kp persist`
+- **切换是运行时改动**，dhcpcd 续约（约 28 分钟）或重启后 IPv4 默认路由会自动装回来 —— 要长期保持请选菜单 8 或跑 `kp persist`
 - 动手前确认有服务商的 VNC / 控制台，并确保 `ssh -6` 能连进来
 - `kp block` 需要 `NET_ADMIN` 权限，容器里没有的话用 `kp keep`
-- 脚本改的是运行时状态，重启失效；要持久化在 `/etc/dhcpcd.conf` 加 `nogateway`
 - DNS 最多生效 3 个 nameserver（glibc MAXNS），所以 `kp fix` 只写 3 个
-- 服务名不同时用 `KP_AGENT=实际服务名 kp restart`；内网网段不同时用 `KP_LAN=x.x.x.x/x`
-- 探针识别不准时用 `KP_PROBE=komari` 或 `KP_PROBE=nezha` 强制指定
 - 面板显示本机 IPv4 ≠ 出网没禁干净，那是探针上报的网卡地址，用 `kp nic off` 处理
-- 哪吒的 `nic_allowlist` 可能被面板下发的远程配置覆盖，面板能改就优先在面板改
-- `kp nic off` 只筛**网卡**不筛地址族：默认排除法会把带 IPv4 的网卡整张排掉，
-  所以留着的那几张网卡最好确实带 IPv6，否则会连 IPv6 都不上报
-- 上报是定时的（Komari 约 5 分钟 / 哪吒默认 30 分钟），改完不会立刻在面板上看到变化
+- 白名单挑的是「整张网卡都没有 IPv4」的网卡，双栈网卡一律不算；所有网卡都双栈时请用 `kp nic off --exclude`
+- 容器里 PID 限额太小会让命令静默失败（`can't fork`），遇到就 `ulimit -u 4096` 后重跑
 
 ---
 

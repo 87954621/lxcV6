@@ -12,8 +12,8 @@
 #   kp fix       换成 IPv6 DNS
 #   kp restart   重启探针
 #   kp nic off   让探针不上报 IPv4（面板不再显示本机 IPv4）
-#                默认排除法：AGENT_EXCLUDE_NICS=<带 IPv4 的网卡>
-#                白名单法：kp nic off --include（只统计纯 IPv6 网卡）
+#                默认白名单：AGENT_INCLUDE_NICS=<纯 IPv6 的网卡，如 eth1>
+#                排除法：kp nic off --exclude（排掉带 IPv4 的网卡，如 eth0）
 #   kp block     iptables 硬性禁止 IPv4 出站
 #   kp unblock   撤除封堵
 #   kp status    查看当前网络状态
@@ -29,7 +29,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.6.0"
+VERSION="1.6.1"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -986,53 +986,140 @@ nezha_conf() {
 # 注：agent 官方没有 IGNORE_IPV4 这类"忽略地址族"的参数，只有网卡白名单。
 NICDROP="/etc/systemd/system/$AGENT.service.d/nic.conf"
 
+# ── 网卡信息采集（单次 ip + 单次 awk，结果缓存）────────────────
+# 为什么这么写：容器（incus/LXC）里 pids.max 往往很小（常见 100~500），
+# 而 `ip | awk | sed | sort | tr` 这种管道每多一级就多 fork 一个进程。
+# 原来的 v6_nics/v4_nics/v6only_nics 每调一次要 fork 5~15 个，
+# 菜单里连着调几次就把 PID 用完 → "can't fork: Resource temporarily unavailable"。
+# 现在改成：一条 `ip -o addr` 读全部地址，一次 awk 算完三类网卡，结果存变量复用。
+KP_NICS_DONE=""
+KP_V4=""; KP_V6=""; KP_V6ONLY=""; KP_IPV4ADDR=""
+
+nics_scan() {
+  [ -n "$KP_NICS_DONE" ] && return 0
+  KP_NICS_DONE=1
+
+  # ① 优先：一条 ip + 一次 awk（共 2 个 fork）
+  if IPOUT="$(ip -o addr show scope global 2>/dev/null)"; then
+    KP_NICS_ALL="$(printf '%s\n' "$IPOUT" | awk '
+      {
+        n = $2
+        sub(/@.*/, "", n)                       # 容器 veth: eth1@if160 → eth1
+        if (n == "" || n == "lo") next
+        if ($3 == "inet")  { v4n[n] = 1; if (v4addr == "") v4addr = $4 }
+        if ($3 == "inet6") { v6n[n] = 1 }
+      }
+      END {
+        # 用逗号分隔，解析端按逗号切，避免空格被 tr 吃掉导致网卡名粘连
+        v4 = ""; v6 = ""; v6o = ""
+        split("", a); i = 0
+        for (n in v6n) { i++; v6 = v6 (i>1 ? "," : "") n }
+        i = 0
+        for (n in v4n) { i++; v4 = v4 (i>1 ? "," : "") n }
+        i = 0
+        for (n in v6n) if (!(n in v4n)) { i++; v6o = v6o (i>1 ? "," : "") n }
+        printf "V4\t%s\nV6\t%s\nV6O\t%s\nA4\t%s\n", v4, v6, v6o, v4addr
+      }')"
+    # 纯 shell 解析（格式 "KEY<TAB>value"），不再 fork
+    KP_V4=""; KP_V6=""; KP_V6ONLY=""; KP_IPV4ADDR=""
+    _oldifs="$IFS"; IFS='
+'
+    for _l in $KP_NICS_ALL; do
+      _k="${_l%%	*}"          # 制表符前的 KEY
+      _v="${_l#*	}"           # 制表符后的 value
+      case "$_k" in
+        V6O) KP_V6ONLY="$_v" ;;
+        V6)  KP_V6="$_v" ;;
+        V4)  KP_V4="$_v" ;;
+        A4)  KP_IPV4ADDR="$_v" ;;
+      esac
+    done
+    IFS="$_oldifs"
+    return 0
+  fi
+
+  # ② 回落：进程真的不够用时，纯 shell 内建读 /proc（连 awk 都不用）
+  #    /proc/net/if_inet6 每行末列是网卡名（空格对齐）
+  #    /proc/net/route    第 2 列为 00000000 的是默认路由网卡
+  _n6=""; _n4=""
+  if [ -r /proc/net/if_inet6 ]; then
+    _oldifs="$IFS"; IFS='
+'
+    for _l in $(cat /proc/net/if_inet6 2>/dev/null); do
+      # 末列是网卡名：从行尾往前切
+      _n="${_l##* }"
+      [ -z "$_n" ] && continue
+      [ "$_n" = "lo" ] && continue
+      case ",$_n6," in *",$_n,"*) ;; *) _n6="${_n6:+$_n6,}$_n" ;; esac
+    done
+    IFS="$_oldifs"
+  fi
+  if [ -r /proc/net/route ]; then
+    _oldifs="$IFS"; IFS='
+'
+    for _l in $(cat /proc/net/route 2>/dev/null); do
+      # 按空白拆出第 1、2 列（不改 IFS 也能用 ${x%% *} 切）
+      _r1="${_l%%[ 	]*}"
+      _r_rest="${_l#"$_r1"}"
+      _r_rest="${_r_rest#"${_r_rest%%[! 	]*}"}"   # 去掉前导空白
+      _r2="${_r_rest%%[ 	]*}"
+      [ "$_r2" = "00000000" ] || continue
+      _n="$_r1"
+      [ -z "$_n" ] && continue
+      case ",$_n4," in *",$_n,"*) ;; *) _n4="${_n4:+$_n4,}$_n" ;; esac
+    done
+    IFS="$_oldifs"
+  fi
+  KP_V6="$_n6"
+  KP_V4="$_n4"
+  # 纯 IPv6 = v6 里有、v4 里没有
+  KP_V6ONLY=""; _sep=""
+  for _n in $(printf '%s' "$KP_V6" | tr ',' ' '); do
+    case ",$KP_V4," in *",$_n,"*) ;; *) KP_V6ONLY="$KP_V6ONLY$_sep$_n"; _sep="," ;; esac
+  done
+}
+
+# 内部统一存「逗号分隔」，下面几个函数负责转成空格分隔给人看
+
 # 本机是否有 IPv4（用来提示"其实已经没有了"）
-has_v4() {
-  [ -n "$(ip -br -4 addr show scope global 2>/dev/null)" ]
-}
-has_v6() {
-  [ -n "$(ip -br -6 addr show scope global 2>/dev/null)" ]
-}
+has_v4() { nics_scan; [ -n "$KP_V4" ]; }
+has_v6() { nics_scan; [ -n "$KP_V6" ]; }
 
 # 网卡名规范化：容器里 veth 会输出成 "eth1@if160"，@ 后面不是真网卡名，
-# agent 匹配不上 → 切掉后缀。
+# agent 匹配不上 → 切掉后缀。（保留此函数供其它地方调用）
 norm_nic() { sed 's/@.*//'; }
 
-# 有全局 IPv6 的网卡名（双栈网卡也包含，仅用于展示）
+# 有全局 IPv6 的网卡名（双栈网卡也包含，仅用于展示）—— 空格分隔带尾空格
 v6_nics() {
-  ip -br -6 addr show scope global 2>/dev/null \
-    | awk '{print $1}' \
-    | norm_nic \
-    | sort -u | tr '\n' ' '
+  nics_scan
+  [ -n "$KP_V6" ] || return 0
+  _o=""; for _n in $(printf '%s' "$KP_V6" | tr ',' ' '); do _o="$_o$_n "; done
+  printf '%s' "$_o"
 }
 
 # ★ 白名单专用：有公网 IPv6 **且没有公网 IPv4** 的网卡。
 #   只取这种网卡，agent 才读不到 IPv4 —— 否则双栈网卡会把 IPv4 一起上报，
-#   等于什么都没屏蔽。（之前用 v6_nics 是 bug：会漏进双栈网卡）
+#   等于什么都没屏蔽。
 v6only_nics() {
-  # 先列出有全局 IPv4 的网卡（这些必须排除）
-  V4LIST=$(ip -br -4 addr show scope global 2>/dev/null | awk '{print $1}' | norm_nic | sort -u)
-  ip -br -6 addr show scope global 2>/dev/null \
-    | awk '{print $1}' \
-    | norm_nic \
-    | sort -u \
-    | while read -r n; do
-        [ -z "$n" ] && continue
-        printf '%s\n' "$V4LIST" | grep -qxF "$n" && continue   # 这台还有 IPv4，跳过
-        printf '%s\n' "$n"
-      done \
-    | tr '\n' ' '
+  nics_scan
+  [ -n "$KP_V6ONLY" ] || return 0
+  _o=""; for _n in $(printf '%s' "$KP_V6ONLY" | tr ',' ' '); do _o="$_o$_n "; done
+  printf '%s' "$_o"
 }
 
-# 逗号分隔的形态（Komari include_nics 用）—— 用 v6only_nics（只含纯 IPv6 网卡）
-v6_nics_csv() {
-  v6only_nics | tr -s ' ' ',' | sed -e 's/^,//' -e 's/,$//'
-}
+# 逗号分隔的形态（Komari include_nics 用）—— 只含纯 IPv6 网卡
+v6_nics_csv() { nics_scan; printf '%s' "$KP_V6ONLY"; }
 
-# 有全局 IPv4 的网卡（exclude_nics 备选方案用）
+# 有全局 IPv4 的网卡（exclude_nics 用）—— 空格分隔带尾空格
 v4_nics() {
-  ip -br -4 addr show scope global 2>/dev/null | awk '{print $1}' | norm_nic | sort -u | tr '\n' ' '
+  nics_scan
+  [ -n "$KP_V4" ] || return 0
+  _o=""; for _n in $(printf '%s' "$KP_V4" | tr ',' ' '); do _o="$_o$_n "; done
+  printf '%s' "$_o"
 }
+
+# 逗号分隔的排除列表（exclude_nics 用）
+v4_nics_csv() { nics_scan; printf '%s' "$KP_V4"; }
 
 # 当前 agent 生效的过滤参数
 nic_now() {
@@ -1154,7 +1241,7 @@ PYEOF
 
 cmd_nic() {
   ACT="${1:-show}"
-  MODE="${2:-exclude}"     # exclude（排除含 IPv4 的网卡，默认）| include（白名单）
+  MODE="${2:-include}"     # include（白名单，默认）| exclude（排除含 IPv4 的网卡）
   KIND="$(probe_kind)"
   hrt "屏蔽 agent 上报 IPv4"
 
@@ -1172,7 +1259,7 @@ cmd_nic() {
     kvp "服务名" "$AGENT"
     kvp "本机网卡" "IPv6: $(v6_nics || echo 无)  IPv4: $(v4_nics || echo 无)"
   fi
-  kvp "本机 IPv4" "$(has_v4 && ip -br -4 addr show scope global 2>/dev/null | awk '{print $3; exit}' || echo 无)"
+  kvp "本机 IPv4" "$(nics_scan; [ -n "$KP_IPV4ADDR" ] && printf '%s' "$KP_IPV4ADDR" || echo 无)"
   [ -n "$CUR" ] && kvp "当前过滤" "$CUR" \
                 || kvp "当前过滤" "未设置（IPv4、IPv6 都上报）"
 
@@ -1191,14 +1278,15 @@ cmd_nic() {
       echo
       dim "面板上的 IPv4 来自 agent 上报，可能是出口 IP，也可能是网卡地址"
       if [ "$KIND" = "nezha" ]; then
-        dim "哪吒：只监控指定网卡（nic_allowlist）"
+        dim "哪吒：nic_allowlist 只列要监控的网卡（没列的就不监控）"
       else
-        V4L="$(v4_nics | tr -s ' ' ',' | sed -e 's/^,//' -e 's/,$//')"
+        V4L="$(v4_nics_csv)"
         V6L="$(v6_nics_csv)"
         dim "Komari：需同时开「从网卡取 IP」+ 网卡过滤，缺一不可"
-        dim "  AGENT_GET_IP_ADDR_FROM_NIC=true + AGENT_EXCLUDE_NICS=<带v4的网卡>"
-        dim "默认排除法：排除带 IPv4 的网卡$( [ -n "$V4L" ] && printf '（本机：%s）' "$V4L" )"
-        [ -n "$V6L" ] && dim "也可用白名单（只读纯 IPv6 网卡：$V6L）：kp nic off --include"
+        dim "  AGENT_GET_IP_ADDR_FROM_NIC=true + AGENT_INCLUDE_NICS=<纯v6的网卡>"
+        [ -n "$V6L" ] && dim "默认白名单：只统计没有 IPv4 的网卡（本机：$V6L）"
+        [ -z "$V6L" ] && dim "本机没有「纯 IPv6」网卡 → 只能改用排除法：kp nic off --exclude"
+        [ -n "$V4L" ] && dim "也可用排除法排掉带 v4 的网卡（本机：$V4L）：kp nic off --exclude"
       fi
       dim "想让它不上报 IPv4：kp nic off"
       dim "想恢复默认（两者都报）：kp nic on"
@@ -1248,11 +1336,12 @@ cmd_nic() {
   # GetIPAddress()），根本不读网卡 —— 所以只设网卡过滤没用。
   # 必须先打开 AGENT_GET_IP_ADDR_FROM_NIC=true 切到「从网卡取 IP」，
   # 网卡过滤才生效。两种过滤方式：
-  #   exclude（排除法，默认）：排除「带 IPv4」的网卡，其余网卡照常统计
-  #   include（白名单）：只读「纯 IPv6」网卡（v6only_nics），不带 v4 的才用得上
+  #   include（白名单，默认）：只读「纯 IPv6」网卡（v6only_nics）——
+  #                            只统计真正没有 IPv4 的网卡，最保险
+  #   exclude（排除法）：排除「带 IPv4」的网卡，其余照常统计
   if [ "$MODE" = "exclude" ]; then
     # 排除法：列出带 IPv4 的网卡，报给 agent「这些别读」
-    NICS_CSV="$(v4_nics | tr -s ' ' ',' | sed -e 's/^,//' -e 's/,$//')"
+    NICS_CSV="$(v4_nics_csv)"
     FILTER_KW="EXCLUDE_NICS"
     FILTER_CLI="--exclude-nics"
     FILTER_ENV="AGENT_EXCLUDE_NICS"
@@ -1262,7 +1351,7 @@ cmd_nic() {
       return 1
     fi
   else
-      NICS_CSV="$(v6_nics_csv)"
+    NICS_CSV="$(v6_nics_csv)"
     FILTER_KW="INCLUDE_NICS"
     FILTER_CLI="--include-nics"
     FILTER_ENV="AGENT_INCLUDE_NICS"
@@ -1272,7 +1361,7 @@ cmd_nic() {
       ALL4="$(v4_nics)"
       [ -n "$ALL6" ] && dim "有 IPv6 的网卡：$ALL6"
       [ -n "$ALL4" ] && dim "有 IPv4 的网卡：$ALL4"
-      dim "所有 IPv6 网卡都同时带 IPv4 → 改用排除法（默认）："
+      dim "所有 IPv6 网卡都同时带 IPv4 → 改用排除法："
       dim "  kp nic off --exclude"
       return 1
     fi
@@ -1413,7 +1502,7 @@ EOF
       cat > "$ENVF" <<EOF
 # kp: 探针环境变量（由 kp nic off 生成）
 AGENT_GET_IP_ADDR_FROM_NIC=true
-AGENT_INCLUDE_NICS=$NICS_CSV
+$FILTER_ENV=$NICS_CSV
 EOF
       kvp "写入 env 文件" "$ENVF"
       # 生成启动包装，方便用户手动拉起时带上变量
@@ -1474,10 +1563,18 @@ EOF
                  || res "  仍有残留：$N2" "$YEL"
   fi
   echo
-  dim "生效要点：agent 已改为「从网卡取 IP」，只遍历白名单网卡"
-  dim "那张网卡上没有 IPv4 → 上报空值 → 面板不再显示 IPv4"
+  if [ "$OFF" = "yes" ]; then
+    if [ "$MODE" = "exclude" ]; then
+      dim "生效要点：agent 改为「从网卡取 IP」，排除了带 IPv4 的网卡"
+      dim "被排除网卡：$NICS_CSV"
+    else
+      dim "生效要点：agent 改为「从网卡取 IP」，只遍历白名单网卡"
+      dim "白名单网卡：$NICS_CSV（这张网卡上没有 IPv4）"
+    fi
+    dim "取不到 IPv4 → 上报空值 → 面板不再显示 IPv4"
+  fi
   dim "面板不会立刻刷新：基础信息默认每 ${INFO_MIN:-5} 分钟上报一次"
-  dim "验证：tr '\\0' '\\n' < /proc/\$(pgrep -f $AGENT | head -1)/environ | grep -iE 'nic|IP_ADDR'"
+  dim "验证：ps -ef | grep $AGENT | grep -o -- '--(include|exclude)-nics[= ][^ ]*'"
 }
 
 # ── 检查更新 ────────────────────────────────────────────
@@ -1749,14 +1846,47 @@ cmd_fire_menu() {
   fi
 }
 
+# ── 资源自检：容器里 PID 用满会让所有命令静默失效 ──────────
+# 症状：`can't fork: Resource temporarily unavailable`，
+# 脚本里的 $(...) 拿到空字符串 → 误判成「本机没有 IPv4」。
+pid_pressure() {
+  _max=""
+  # cgroup v2 / v1
+  for f in /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids/pids.max; do
+    [ -r "$f" ] && { _max="$(cat "$f" 2>/dev/null)"; [ -n "$_max" ] && break; }
+  done
+  [ "$_max" = "max" ] && _max=""
+  _ul="$(ulimit -u 2>/dev/null)"
+  _cur=""
+  for f in /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids/pids.current; do
+    [ -r "$f" ] && { _cur="$(cat "$f" 2>/dev/null)"; [ -n "$_cur" ] && break; }
+  done
+  # 判定：限额存在，且已用 >80%，或 ulimit -u 很小（<200）
+  if [ -n "$_max" ] && [ -n "$_cur" ] && [ "$_max" -gt 0 ] 2>/dev/null; then
+    [ "$((_cur * 100 / _max))" -ge 80 ] && { printf 'high'; return; }
+  fi
+  if [ -n "$_ul" ] && [ "$_ul" -gt 0 ] 2>/dev/null && [ "$_ul" -lt 200 ]; then
+    printf 'low'; return
+  fi
+  printf ''
+}
+
 # ── 二级菜单：面板 IPv4 显示 ────────────────────────────
 cmd_nic_menu() {
   hr "面板显示的本机 IPv4"
+  _pp="$(pid_pressure)"
+  if [ "$_pp" = "high" ] || [ "$_pp" = "low" ]; then
+    warn "本机进程数快用满了（PID 限额偏小）"
+    dim "这会让命令起不来，识别网卡时出错"
+    dim "抬高限额：ulimit -u 4096   然后重新跑 kp"
+    dim "看限额值：cat /sys/fs/cgroup/pids.max ; ulimit -u"
+    echo
+  fi
   if [ -n "$(nic_now)" ]; then
     kvp "当前状态" "已屏蔽（agent 不上报 IPv4）"
     echo
     if ask "恢复上报 IPv4？"; then
-      cmd_nic on exclude     # 撤销排除配置
+      cmd_nic on include     # 撤销白名单配置
     else
       echo "  已取消"
     fi
@@ -1767,18 +1897,24 @@ cmd_nic_menu() {
     dim "屏蔽后 agent 只上报 IPv6，面板不再显示本机 IPv4"
     echo
     if [ "$(probe_kind)" = "komari" ]; then
-      V4="$(v4_nics | tr -s ' ' ',' | sed -e 's/^,//' -e 's/,$//')"
+      V4="$(v4_nics_csv)"
       V6O="$(v6_nics_csv)"
-      if [ -n "$V4" ]; then
-        dim "默认排除法：只排除带 IPv4 的网卡（$V4），其余照常统计"
-      fi
-      if [ -z "$V6O" ] && [ -n "$V4" ]; then
-        dim "（白名单不可用：没有「只有 IPv6」的网卡）"
+      if [ -n "$V6O" ]; then
+        dim "默认白名单：只统计没有 IPv4 的网卡（$V6O）"
+        [ -n "$V4" ] && dim "这些网卡带 IPv4，会被跳过：$V4"
+      else
+        warn "本机没有「只有 IPv6、没有 IPv4」的网卡"
+        dim "白名单用不了，需要改用排除法（菜单里会接着问）"
       fi
     fi
     echo
     if ask "屏蔽 agent 上报 IPv4？"; then
-      cmd_nic off exclude     # 默认排除法：不统计带 IPv4 的网卡（如 eth0）
+      if [ -n "$V6O" ]; then
+        cmd_nic off include    # 默认白名单：只统计纯 IPv6 的网卡（如 eth1）
+      else
+        dim "没有纯 IPv6 网卡，自动改用排除法"
+        cmd_nic off exclude    # 排掉带 IPv4 的网卡（如 eth0）
+      fi
     else
       echo "  已取消"
     fi
@@ -1848,8 +1984,8 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp persist off  取消持久化
   kp nic          查看探针是否上报 IPv4
   kp nic off      不上报 IPv4（面板不再显示本机 IPv4）
-                  默认「排除法」：把带 IPv4 的网卡排除掉，其余网卡照常统计
-  kp nic off --include  改用「白名单」：只统计纯 IPv6 网卡（无 IPv4 的那种）
+                  默认「白名单」：只统计没有 IPv4 的纯 IPv6 网卡
+  kp nic off --exclude  改用「排除法」：排掉带 IPv4 的网卡，其余照常统计
   kp nic on       恢复默认，IPv4、IPv6 都上报
   kp update       检查并提示更新（= kp update ask）
   kp update check 只检查，不安装
@@ -1861,9 +1997,10 @@ kp — VPS 纯 IPv6 切换 / 探针自救
 
 支持的探针（自动识别，也可强制指定）：
   Komari   → get_ip_addr_from_nic + 网卡过滤
-             默认排除法：AGENT_EXCLUDE_NICS=<带 IPv4 的网卡>（如 eth0）
-             白名单法：  AGENT_INCLUDE_NICS=<只有 IPv6 的网卡>
-  哪吒 Nezha → nic_allowlist，改 /opt/nezha/agent/config.yml
+             默认白名单：AGENT_INCLUDE_NICS=<只有 IPv6 的网卡>（如 eth1）
+             排除法：    AGENT_EXCLUDE_NICS=<带 IPv4 的网卡>（如 eth0）
+  哪吒 Nezha → nic_allowlist，只列要监控的网卡（不列 = 不监控）：
+               改 /opt/nezha/agent/config.yml，如 eth1: true
   面板上的 IPv4 来自 agent 上报的地址列表，路由/DNS 都管不了，只能改 agent 配置。
 
 环境变量：
@@ -1887,8 +2024,8 @@ case "${1:-}" in
   unblock)   cmd_unblock ;;
   persist)   cmd_persist "${2:-on}" ;;
   nic|nics)
-    # 第三个参数可指定过滤模式：--include（白名单）/ --exclude（排除，默认）
-    NICMODE="exclude"
+    # 第三个参数可指定过滤模式：--include（白名单，默认）/ --exclude（排除）
+    NICMODE="include"
     case "${3:-}" in
       --include|-i|include) NICMODE="include" ;;
       --exclude|-e|exclude) NICMODE="exclude" ;;
