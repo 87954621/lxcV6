@@ -1,10 +1,10 @@
 #!/bin/sh
-# fip-v1.0.sh — 网卡绑地址 + Incus 网桥 kp + 面板 routed 模式一键备好
+# fip-v1.1.sh — 网卡绑地址 + Incus 网桥 kp + 面板 routed 模式一键备好
 #
 # 不认探针、不改探针配置、不开机自启、不记账本、不写任何文件。
 # 绑地址用 noprefixroute：只让地址出现在网卡上，不往路由表里加东西。
 #
-# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v1.0.sh → fip-v1.1.sh）。
+# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v1.1.sh → fip-v1.2.sh）。
 #
 # 用法：
 #   fip                     终端里进菜单；非 TTY 时只列候选
@@ -40,7 +40,7 @@
 #   FIP_COLOR=0                 关掉颜色（也认 NO_COLOR）
 set -u
 
-VERSION="1.0"
+VERSION="1.1"
 
 DEV="${FIP_DEV:-fip0}"
 NOPREFIX="${FIP_NOPREFIXROUTE:-1}"
@@ -528,6 +528,9 @@ cmd_down() {
 
 # ── Incus 网桥：假 /64 交给 Incus 自动下发 ────────────────
 have_incus() { command -v incus >/dev/null 2>&1; }
+
+# ps 有的系统不认 ax，退回 -ef
+ps_all() { ps ax 2>/dev/null || ps -ef 2>/dev/null || true; }
 
 incus_containers() {
   incus list -c n,t --format csv 2>/dev/null | awk -F, '$2=="CONTAINER"{print $1}'
