@@ -1,10 +1,10 @@
 #!/bin/sh
-# fip-v0.8.sh — 建网卡绑地址 + Incus 假 /64 网桥（kp）
+# fip-v0.9.sh — 网卡绑地址 + Incus 网桥 kp + 面板 routed 模式一键备好
 #
 # 不认探针、不改探针配置、不开机自启、不记账本、不写任何文件。
 # 绑地址用 noprefixroute：只让地址出现在网卡上，不往路由表里加东西。
 #
-# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.8.sh → fip-v0.9.sh）。
+# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.9.sh → fip-v1.0.sh）。
 #
 # 用法：
 #   fip                     终端里进菜单；非 TTY 时只列候选
@@ -40,7 +40,7 @@
 #   FIP_COLOR=0                 关掉颜色（也认 NO_COLOR）
 set -u
 
-VERSION="0.8"
+VERSION="0.9"
 
 DEV="${FIP_DEV:-fip0}"
 NOPREFIX="${FIP_NOPREFIXROUTE:-1}"
@@ -624,6 +624,40 @@ kp_status() {
   return 0
 }
 
+# ── 面板 routed 模式：主机侧一次性备好 ────────────────────
+# 面板用「父接口 + IPv6 子网」分配 /128，靠的是这条段路由指向父接口。
+# fip 默认 noprefixroute 不加路由，这里替你补上，省得手动。
+panel_up() {
+  have_incus || dim "没找到 incus（面板走 Incus 的话要在宿主机上跑）"
+  need_root
+  hr "面板 routed 模式（父接口 $DEV）"
+  _p64="${BRIDGE_PREFIX}::/64"
+
+  collect_addrs "$_p64" || return 1
+  ensure_dev || return 1
+  case "$ADDRS" in *:*) v6_enable "$DEV" ;; esac
+  for _a in $ADDRS; do add_addr "$_a"; done
+
+  echo
+  if ip -6 route replace "$_p64" dev "$DEV" 2>/dev/null; then
+    ok "路由：$_p64 dev $DEV"
+  else
+    warn "加路由失败，手动：ip -6 route replace $_p64 dev $DEV"
+  fi
+  ip -6 route show 2>/dev/null | grep -F "$_p64" | sed 's/^/   /'
+
+  echo
+  hr "面板里这样填"
+  kvp "IPv6 父接口" "$DEV"
+  kvp "IPv6 子网" "$_p64"
+  echo
+  dim "之后新建的容器由面板自动分 /128，不用再手动"
+  if ps_all | grep -v grep | grep -q 'ndppd'; then
+    dim "本机在跑 ndppd：它若代理 $DEV，删 $DEV 前先停 ndppd（否则会空转 100% CPU）"
+  fi
+  return 0
+}
+
 # ── 菜单：状态条 ──────────────────────────────────────────
 menu_status() {
   dot_on()  { printf '%s◉%s' "$LIME_B" "$RST"; }
@@ -798,6 +832,7 @@ ui_help() {
   note "  fip kp                 建网桥 $BRIDGE（${BRIDGE_PREFIX}::/64）并挂到所有容器"
   note "  fip kp status          看网桥 / 挂载 / 容器地址"
   note "  fip kp down            摘除并删除网桥"
+  note "  fip panel             面板 routed 模式：备好 $DEV + ${BRIDGE_PREFIX}::/64 的段路由"
   dim "地址由 Incus 的 dnsmasq 发 RA，容器自动 SLAAC，和 HE 那套一样"
 
   sec "地址写法"
@@ -867,14 +902,16 @@ ui_kp() {
     item "1" "建网桥 $BRIDGE 并挂到所有容器"
     item "2" "查看状态"
     item "3" "从所有容器摘除并删除 $BRIDGE"
+    item "4" "面板 routed 模式：备好 $DEV + 段路由"
     item "0" "返回主菜单"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-3]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-4]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
     case "$c" in
       1) kp_up; pause ;;
       2) kp_status; pause ;;
       3) if ask "确认摘除所有容器的 $BRIDGE、并删除网桥？"; then echo; kp_down; fi; pause ;;
+      4) panel_up; pause ;;
       0|q|Q) return 0 ;;
       *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
@@ -941,6 +978,7 @@ usage() {
   fip kp                    建 Incus 假 /64 网桥 kp，并挂到所有容器（自动 SLAAC）
   fip kp status             看网桥、挂载、容器拿到的地址
   fip kp down               从所有容器摘除并删除网桥
+  fip panel                 面板 routed 模式：备好 $DEV + 段路由（一条命令）
 
 菜单 1「内置朝鲜 IP」是 6 选 1，另加两个生成项：
   1) 104.29.195.20/32        4) 104.29.195.23/32
@@ -1017,6 +1055,12 @@ case "${1:-}" in
         status|show|stat)       kp_status ;;
         down|off|del|delete|rm) kp_down ;;
         *) printf '用法：fip kp [up|status|down]\n' ;;
+      esac
+      ;;
+  panel|routed)
+      case "${2:-up}" in
+        up|on|create|init)      panel_up ;;
+        *)                      panel_up ;;
       esac
       ;;
   up|on|create|new)
