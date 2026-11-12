@@ -1,5 +1,5 @@
 #!/bin/sh
-# fip-v3.3.sh — 只造假网桥：一段假 /64 + 假 IPv4 池，容器/地址分配交给面板
+# fip-v3.4.sh — 只造假网桥：一段假 /64 + 假 IPv4 池，容器/地址分配交给面板
 #
 # 和 HE tunnelbroker 一样：你只负责把一段 /64 配到一个网桥上，
 # 后面谁要用（面板 routed、容器挂网卡、你自己 ip addr add）都不归它管。
@@ -9,7 +9,7 @@
 #     ipv6.address=2606:54c1:1:c4::1/64 ipv6.nat=false
 #
 # 本脚本**不碰** profile、不碰容器、不写任何文件。
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.3.sh → fip-v3.4.sh）。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.4.sh → fip-v3.5.sh）。
 #
 # 用法：
 #   fip                菜单
@@ -27,16 +27,16 @@
 #   FIP_BRIDGE=kp                网桥（Incus 网络）名
 #   FIP_PREFIX=2606:54c1:1:c4     默认 /64 前缀
 #   FIP_PREFIXES="..."           内置候选前缀
-#   FIP_V4_BRIDGE=175.45.176.1/22 假 IPv4 池（none = 不开）
+#   FIP_V4_BRIDGE=none           假 IPv4 池（默认关；要就写 175.45.176.1/22）
 #   FIP_COLOR=0                  关颜色
 set -u
 
-VERSION="3.3"
+VERSION="3.4"
 
 BRIDGE="${FIP_BRIDGE:-kp}"
 PREFIX="${FIP_PREFIX:-2606:54c1:1:c4}"
 PREFIXES="${FIP_PREFIXES:-2606:54c1:1:c4 2a14:67c1:a02f 2a12:bec0:160}"
-V4_BRIDGE="${FIP_V4_BRIDGE:-175.45.176.1/22}"
+V4_BRIDGE="${FIP_V4_BRIDGE:-none}"
 V4_IP="${V4_BRIDGE%%/*}"
 BUILTIN="104.29.195.20/32 104.29.195.21/32 104.29.195.22/32 104.29.195.23/32 2606:54c1:1:c4::/64 175.45.176.0/22"
 
@@ -406,7 +406,14 @@ cmd_up() {
       dim "换段：fip switch $_want"
       return 1
     fi
-    ok "网桥 $BRIDGE 已存在（$_cur::/64），不用重建"
+    ok "网桥 $BRIDGE 已存在（$_cur::/64）"
+    if [ "$V4_BRIDGE" = "none" ] && ip -4 -o addr show dev "$BRIDGE" scope global 2>/dev/null | grep -q .; then
+      if incus network set "$BRIDGE" ipv4.address none >/dev/null 2>&1; then
+        ok "已关掉网桥上的 IPv4 池"
+      else
+        warn "关 IPv4 失败：incus network set $BRIDGE ipv4.address none"
+      fi
+    fi
     return 0
   fi
 
@@ -414,7 +421,7 @@ cmd_up() {
        ipv6.address="${_want}::1/64" ipv6.nat=false >/dev/null 2>&1; then
     ok "已建网桥 $BRIDGE"
     kvp "IPv6" "${_want}::1/64"
-    kvp "IPv4" "$V4_BRIDGE"
+    [ "$V4_BRIDGE" != "none" ] && kvp "IPv4" "$V4_BRIDGE"
     echo
     dim "后面怎么用都行：面板 routed（父接口填 $BRIDGE）、容器加网卡、或 fip bridge add"
   else
@@ -591,10 +598,12 @@ menu_status() {
   printf '%s%s::/64%s' "$BOLD_W" "$(cur_prefix)" "$RST"
   echo
 
-  bar
-  printf '%s◈%s %sIPv4%s ' "$LIME_B" "$RST" "$GRA" "$RST"
-  printf '%s%s%s' "$BOLD_W" "$V4_BRIDGE" "$RST"
-  echo
+  if [ "$V4_BRIDGE" != "none" ]; then
+    bar
+    printf '%s◈%s %sIPv4%s ' "$LIME_B" "$RST" "$GRA" "$RST"
+    printf '%s%s%s' "$BOLD_W" "$V4_BRIDGE" "$RST"
+    echo
+  fi
 
   bar
   printf '%s◈%s %s引用%s ' "$TEAL_B" "$RST" "$GRA" "$RST"
@@ -794,7 +803,7 @@ usage() {
   cat <<'EOF'
 用法：
   fip                     菜单（终端）
-  fip up [前缀]           建网桥 kp（默认 2606:54c1:1:c4）
+  fip up [前缀]           建网桥 kp（默认 2606:54c1:1:c4，IPv6 only）
   fip status              网桥地址、谁在引用（只读）
   fip check               体检
   fip switch <前缀>       换段（先删再建）
@@ -806,7 +815,7 @@ usage() {
 
 它只做这一件事：
   incus network create kp \
-    ipv4.address=175.45.176.1/22 ipv4.nat=false \
+    ipv4.address=none \
     ipv6.address=2606:54c1:1:c4::1/64 ipv6.nat=false
 
 不建 profile、不碰容器、不写任何文件。
@@ -816,7 +825,7 @@ usage() {
   FIP_BRIDGE=kp                  网桥（Incus 网络）名
   FIP_PREFIX=2606:54c1:1:c4       默认前缀
   FIP_PREFIXES="..."             内置候选前缀
-  FIP_V4_BRIDGE=175.45.176.1/22  假 IPv4 池（none 关）
+  FIP_V4_BRIDGE=175.45.176.1/22  假 IPv4 池（默认 none = 关）
   FIP_COLOR=0                    关颜色
   FIP_MENU=0                     无参数不进菜单
 
@@ -825,7 +834,7 @@ usage() {
   * fip down 删不掉时，会打印 used_by；先去面板/容器上摘网卡。
 
 安装：
-  install -m 755 fip-v3.3.sh /usr/local/bin/fip
+  install -m 755 fip-v3.4.sh /usr/local/bin/fip
 EOF
 }
 
