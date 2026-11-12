@@ -1,10 +1,10 @@
 #!/bin/sh
-# fip-v0.9.sh — 网卡绑地址 + Incus 网桥 kp + 面板 routed 模式一键备好
+# fip-v1.0.sh — 网卡绑地址 + Incus 网桥 kp + 面板 routed 模式一键备好
 #
 # 不认探针、不改探针配置、不开机自启、不记账本、不写任何文件。
 # 绑地址用 noprefixroute：只让地址出现在网卡上，不往路由表里加东西。
 #
-# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.9.sh → fip-v1.0.sh）。
+# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v1.0.sh → fip-v1.1.sh）。
 #
 # 用法：
 #   fip                     终端里进菜单；非 TTY 时只列候选
@@ -40,7 +40,7 @@
 #   FIP_COLOR=0                 关掉颜色（也认 NO_COLOR）
 set -u
 
-VERSION="0.9"
+VERSION="1.0"
 
 DEV="${FIP_DEV:-fip0}"
 NOPREFIX="${FIP_NOPREFIXROUTE:-1}"
@@ -555,27 +555,51 @@ kp_up() {
   fi
 
   echo
+  _cl="$(incus_containers)"
   _n=0
-  for _c in $(incus_containers); do
+  for _c in $_cl; do
     _n=$(( _n + 1 ))
-    if incus config device add "$_c" "$BRIDGE" nic network="$BRIDGE" >/dev/null 2>&1; then
+    if incus config device show "$_c" 2>/dev/null | grep -q "network: $BRIDGE"; then
+      dim "$_c  已经挂着 $BRIDGE"
+    elif incus config device add "$_c" "$BRIDGE" nic network="$BRIDGE" >/dev/null 2>&1; then
       ok "$_c  挂上 $BRIDGE"
     else
-      dim "$_c  已有 $BRIDGE 或挂载失败，跳过"
+      warn "$_c  挂载失败"
     fi
+    # 容器里新网卡常是 disable_ipv6=1（all=1 时新接口默认关），打开并拉起
+    incus exec "$_c" -- sh -c '
+      for i in /sys/class/net/*; do
+        n="${i##*/}"
+        case "$n" in lo|eth0) continue ;; esac
+        sysctl -w "net.ipv6.conf.$n.disable_ipv6=0" >/dev/null 2>&1 || \
+          echo 0 > "/proc/sys/net/ipv6/conf/$n/disable_ipv6" 2>/dev/null
+        ip link set "$n" up 2>/dev/null
+      done
+    ' >/dev/null 2>&1
   done
   [ "$_n" -eq 0 ] && warn "没发现有容器（incus list）"
 
   echo
-  dim "等 3 秒让容器收 RA 自动配地址…"
-  sleep 3
+  dim "等容器收 RA 自动配地址（最多 10 秒）…"
+  _w=0
+  while [ "$_w" -lt 10 ]; do
+    _left=0
+    for _c in $_cl; do
+      _a="$(incus exec "$_c" -- ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | grep -F "${BRIDGE_PREFIX}:" | head -1)"
+      [ -n "$_a" ] || _left=$(( _left + 1 ))
+    done
+    [ "$_left" -eq 0 ] && break
+    sleep 1
+    _w=$(( _w + 1 ))
+  done
+
   hr "容器里的 IPv6"
-  for _c in $(incus_containers); do
+  for _c in $_cl; do
     _a="$(incus exec "$_c" -- ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
-    kvp "$_c" "${_a:-（还没拿到，稍后：fip kp status）}"
+    kvp "$_c" "${_a:-（还没拿到：容器里 ip -6 addr 自查，或再跑一次 fip kp）}"
   done
   echo
-  dim "要让探针只报这张卡：哪吒 nic_allowlist / Komari INCLUDE_NICS 填容器里的网卡名（一般 eth1）"
+  dim "要让探针只报这张卡：哪吒 nic_allowlist / Komari INCLUDE_NICS 填容器里的网卡名（一般 eth1/eth2）"
   return 0
 }
 
