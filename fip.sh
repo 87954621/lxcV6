@@ -1,5 +1,5 @@
 #!/bin/sh
-# fip-v3.2.sh — 只造假网桥：一段假 /64 + 假 IPv4 池，容器/地址分配交给面板
+# fip-v3.3.sh — 只造假网桥：一段假 /64 + 假 IPv4 池，容器/地址分配交给面板
 #
 # 和 HE tunnelbroker 一样：你只负责把一段 /64 配到一个网桥上，
 # 后面谁要用（面板 routed、容器挂网卡、你自己 ip addr add）都不归它管。
@@ -9,7 +9,7 @@
 #     ipv6.address=2606:54c1:1:c4::1/64 ipv6.nat=false
 #
 # 本脚本**不碰** profile、不碰容器、不写任何文件。
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.2.sh → fip-v3.3.sh）。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.3.sh → fip-v3.4.sh）。
 #
 # 用法：
 #   fip                菜单
@@ -31,7 +31,7 @@
 #   FIP_COLOR=0                  关颜色
 set -u
 
-VERSION="3.2"
+VERSION="3.3"
 
 BRIDGE="${FIP_BRIDGE:-kp}"
 PREFIX="${FIP_PREFIX:-2606:54c1:1:c4}"
@@ -343,6 +343,42 @@ used_by() {
   incus network show "$BRIDGE" 2>/dev/null | sed -n '/^used_by:/,$p' | grep '^- ' | sed 's/^-  *//'
 }
 
+# 只读扫描：哪些 profile / 容器上有设备引用 kp
+refs_list() {
+  for _p in $(incus profile list -c n --format csv 2>/dev/null); do
+    incus profile device show "$_p" 2>/dev/null | awk -v b="$BRIDGE" -v k=profile -v n="$_p" '
+      /^[A-Za-z0-9_.-]+:$/ { dev=$0; sub(/:$/,"",dev) }
+      /^  (network|parent): / { if ($2 == b) print k "|" n "|" dev }
+    '
+  done
+  for _c in $(incus list -c n,t --format csv 2>/dev/null | awk -F, '$2=="CONTAINER"{print $1}'); do
+    incus config device show "$_c" 2>/dev/null | awk -v b="$BRIDGE" -v k=container -v n="$_c" '
+      /^[A-Za-z0-9_.-]+:$/ { dev=$0; sub(/:$/,"",dev) }
+      /^  (network|parent): / { if ($2 == b) print k "|" n "|" dev }
+    '
+  done
+}
+
+# 打印引用 + 摘除命令
+refs_report() {
+  _r="$(refs_list)"
+  if [ -z "$_r" ]; then
+    dim "没扫到引用（那可能是别的原因，见上面的原始报错）"
+    return 0
+  fi
+  dim "还引用 $BRIDGE 的东西："
+  printf '%s\n' "$_r" | while IFS='|' read -r _k _n _dv; do
+    if [ "$_k" = "profile" ]; then
+      printf '    profile %s  设备 %s\n' "$_n" "$_dv"
+      printf '      incus profile device remove %s %s\n' "$_n" "$_dv"
+    else
+      printf '    %s  设备 %s\n' "$_n" "$_dv"
+      printf '      incus config device remove %s %s\n' "$_n" "$_dv"
+    fi
+  done
+  return 0
+}
+
 # ── 命令 ─────────────────────────────────────────────────
 cmd_up() {
   need_incus || return 1
@@ -354,9 +390,10 @@ cmd_up() {
 
   if [ "$(net_state)" = "stale" ]; then
     warn "Incus 里有 $BRIDGE，但 Linux 设备不在，先删掉对象再建"
-    if ! incus network delete "$BRIDGE" >/dev/null 2>&1; then
-      err "删不掉，还有东西在用："
-      used_by | sed 's/^/    /'
+    if ! _out="$(incus network delete "$BRIDGE" 2>&1)"; then
+      err "删不掉：$_out"
+      echo
+      refs_report
       dim "先在面板/容器上摘掉这张网卡，再 fip up"
       return 1
     fi
@@ -465,13 +502,14 @@ cmd_down() {
     dim "网桥 $BRIDGE 不存在"
     return 0
   fi
-  if incus network delete "$BRIDGE" >/dev/null 2>&1; then
+  if _out="$(incus network delete "$BRIDGE" 2>&1)"; then
     ok "已删除网桥 $BRIDGE"
   else
-    err "删不掉，还有东西在用："
-    used_by | sed 's/^/    /'
+    err "删不掉：$_out"
     echo
-    dim "这个脚本不动容器/profile；先在上面把这张网卡摘掉再来删"
+    refs_report
+    echo
+    dim "这个脚本不动容器/profile；按上面命令摘掉后再 fip down"
     return 1
   fi
   return 0
@@ -787,7 +825,7 @@ usage() {
   * fip down 删不掉时，会打印 used_by；先去面板/容器上摘网卡。
 
 安装：
-  install -m 755 fip-v3.2.sh /usr/local/bin/fip
+  install -m 755 fip-v3.3.sh /usr/local/bin/fip
 EOF
 }
 
