@@ -4,7 +4,7 @@ VPS 纯 IPv6 切换脚本，配合 Komari / 哪吒（Nezha）探针使用。
 
 让被监控机**只走 IPv6**，并且**不把本机 IPv4 泄露给面板**。
 
-![](https://img.shields.io/badge/version-1.6.2-blue) ｜ 更新：`kp update`
+![](https://img.shields.io/badge/version-1.7.0-blue) ｜ 更新：`kp update`
 
 > 前置：机器已安装探针（Komari 或哪吒 v2）。脚本会自动识别，也可用 `KP_PROBE=` 强制指定。
 
@@ -39,7 +39,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
   │   kp  纯 IPv6 切换 · 探针自救        │
   │  让被监控机只走 IPv6，不泄露 IPv4    │
   ╰──────────────────────────────────────╯
-   ◆ kp 1.6.2   ·   ONLY IPv6
+   ◆ kp 1.7.0   ·   ONLY IPv6
 
    ┃ ◈ 探针 ◉ komari-agent ▐ 运行中 ▐   隔离 IPv4
    ┃ ◈ IPv4 ◍ 10.10.2.25/22    ▐ 出网已断 ▐
@@ -59,6 +59,7 @@ wget -qO /usr/local/bin/kp https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh
 
    ┄┄ 其他 ┄┄
    ▸  9   检查更新
+   ▸  f   伪造 IP 网卡（改面板显示的归属地）
    ▸  0   退出
 ```
 
@@ -93,6 +94,7 @@ kp restart                   # 重启探针，让它走 IPv6
 | `kp update` | 检查更新（`check` 只查 / `force` 直接装） |
 | `kp status` | 查看当前网络状态 |
 | `kp unlock` | 清理旧版 lockv6 在 `/etc/hosts` 留下的记录 |
+| `kp fakeip` / `kp fakeip off` | 建 / 删假 IP 网卡，改面板显示的归属地 |
 | `kp version` / `kp help` | 版本 / 帮助 |
 
 ---
@@ -168,6 +170,27 @@ ps -ef | grep -v grep | grep -E 'komari|nezha'  # 看进程实际参数
 ```
 
 期望看到 `--get-ip-addr-from-nic --include-nics eth1`（或 `--exclude-nics eth0`）。
+
+---
+
+## 让面板显示别的归属地
+
+`kp fakeip` 建一张虚拟网卡绑上指定 IP，再让探针只监控它 —— 面板查 GeoIP 时按这个 IP 显示国家。
+
+```bash
+kp fakeip                 # 默认 31.6.16.15（朝鲜 · 平壤）
+kp fakeip 1.2.3.4         # 自定义 IPv4
+kp fakeip 2401:5000::1    # 自定义 IPv6
+kp fakeip status          # 看状态
+kp fakeip off             # 删网卡、清开机自启、恢复探针配置
+```
+
+菜单里选 `f` 一样能用。脚本会配好开机自启（OpenRC `/etc/local.d/`、systemd unit 或 `/etc/rc.local`）并重启探针。
+
+> 只改 agent **上报的地址**：这个 IP 不可达、不参与路由，外部服务看到的仍是真实出口 IP。
+> 面板若反查连接来源 IP，或 GeoIP 库不认这个段，可能仍显示真实归属地。
+> 哪吒默认 30 分钟才上报一轮，改完不会立刻变。
+> 纯 IPv4 机器也能用（fakeip 不碰路由，不受「必须先有 IPv6」的护栏限制）；但 `kp check`、`kp nic off` 这类切换命令只适用于双栈 / 纯 IPv6 环境。
 
 ---
 

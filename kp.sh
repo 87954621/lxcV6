@@ -1334,7 +1334,9 @@ cmd_nic() {
       dim "想恢复默认（两者都报）：kp nic on"
       return 0 ;;
     off|hide|drop|exclude)
-      if ! has_v6; then
+      # 护栏是给「屏蔽 IPv4 后靠 IPv6 存活」用的。kp fakeip 只改 agent 上报的
+      # 网卡白名单，不动路由，纯 IPv4 机器照样能用 —— 这种调用跳过检查。
+      if [ "${KP_SKIP_V6_GUARD:-0}" != "1" ] && ! has_v6; then
         res "本机没有全局 IPv6，屏蔽后可能完全失联" "$RED"
         dim "先确认 ip -6 addr 有公网地址，再操作"
         return 1
@@ -1358,7 +1360,7 @@ cmd_nic() {
     esac
     echo
     hr "重启探针"
-    if restart_agent; then kvp "$AGENT" "已重启"; else dim "没能自动重启，请手动重启"; fi
+    if restart_agent; then kvp "$(unit_name)" "已重启"; else dim "没能自动重启，请手动重启"; fi
     sleep 1
     echo
     hr "结果"
@@ -1625,6 +1627,7 @@ EOF
 # 只影响「上报值」：地址不可达、不参与路由，外部服务看到的仍是真实出口 IP；
 # 面板若反查 gRPC 连接来源 IP，也可能覆盖这里的上报值。
 KP_FAKE_NICS=""
+KP_SKIP_V6_GUARD=0
 FAKE_DEV="kp0"
 FAKE_IP_DEFAULT="31.6.16.15"          # KP / Pyongyang
 FAKE_CONF="/etc/kp-fakeip.conf"
@@ -1820,9 +1823,11 @@ cmd_fakeip_on() {
 
   hr "让探针只监控这张网卡"
   KP_FAKE_NICS="$DEV"          # 让 v6_nics()/v6_nics_csv() 临时返回 kp0
+  KP_SKIP_V6_GUARD=1           # 只改上报、不动路由，跳过「没 IPv6 会失联」护栏
   cmd_nic off include
   RC=$?
   KP_FAKE_NICS=""
+  KP_SKIP_V6_GUARD=0
   [ "$RC" -eq 0 ] || warn "探针配置没写成，网卡已建好，可手动把白名单设为 $DEV"
 
   echo
