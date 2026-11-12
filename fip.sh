@@ -1,21 +1,23 @@
 #!/bin/sh
-# fip-v0.3.sh — 只做一件事：建一张网卡，把 IP / IP 段绑上去
+# fip-v0.4.sh — 只做一件事：建一张网卡，把 IP / IP 段绑上去
 #
 # 不认探针、不改探针配置、不开机自启、不记账本、不写任何文件。
 # 绑地址用 noprefixroute：只让地址出现在网卡上，不往路由表里加东西。
 #
-# 版本规则：每次改动 +0.1，文件名跟着走（fip-v0.3.sh → fip-v0.4.sh）。
+# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.4.sh → fip-v0.5.sh）。
 #
 # 用法：
-#   fip                     终端里进菜单；非 TTY 时等同 fip up
-#   fip up [地址...]        建网卡并绑地址；不带地址 = 内置朝鲜地址组
+#   fip                     终端里进菜单；非 TTY 时只列候选
+#   fip up                  选一条内置朝鲜 IP（6 选 1）
+#   fip up <地址...>        建网卡并绑地址 / 段
+#   fip up --all            6 条内置地址全部绑上
 #   fip add <地址...>       往已有网卡补地址（等同 fip up）
 #   fip gen6 / gen4         只生成一个段内地址并打印（/128、/32）
 #   fip status              看网卡和地址
 #   fip down                删网卡（连同上面的地址）
 #   fip help / fip version
 #
-# 菜单 1「内置朝鲜 IP」可选：绑整段 / 从 /64 生成 /128 / 从 /22 生成 /32
+# 菜单 1「内置朝鲜 IP」是 6 选 1，另有「从 /64 生成 /128」「从 /22 生成 /32」
 #
 # 地址写法：
 #   单个 IP     104.29.195.20              → 104.29.195.20/32
@@ -33,7 +35,7 @@
 #   FIP_COLOR=0                 关掉颜色（也认 NO_COLOR）
 set -u
 
-VERSION="0.3"
+VERSION="0.4"
 
 DEV="${FIP_DEV:-fip0}"
 NOPREFIX="${FIP_NOPREFIXROUTE:-1}"
@@ -437,6 +439,11 @@ cmd_up() {
   return 0
 }
 
+# 6 条全绑（脚本用：fip up --all）
+cmd_up_all() {
+  cmd_up $DEFAULT_ADDRS
+}
+
 cmd_status() {
   hrt "FIP 状态"
   if ip link show "$DEV" >/dev/null 2>&1; then
@@ -454,7 +461,7 @@ cmd_status() {
   else
     kvp "网卡" "$DEV 未创建"
     echo
-    dim "创建：fip up（内置朝鲜地址）或 fip up <IP/段>"
+    dim "创建：fip up（内置 6 选 1）或 fip up <IP/段>"
   fi
   return 0
 }
@@ -535,19 +542,28 @@ banner() {
 }
 
 # ── 菜单动作 ──────────────────────────────────────────────
-ui_up_default() {
-  hr "创建 — 内置朝鲜地址"
-  _n=0
-  for _a in $DEFAULT_ADDRS; do note "  $_a"; _n=$(( _n + 1 )); done
-  echo
-  dim "共 $_n 条；要改：FIP_DEFAULT_ADDRS=\"...\" fip"
+# 取列表里第 N 个：pick_nth <序号> <列表...>
+pick_nth() {
+  _i="$1"; shift
+  while [ "$_i" -gt 1 ] && [ "$#" -gt 1 ]; do
+    shift
+    _i=$(( _i - 1 ))
+  done
+  [ "$#" -ge 1 ] || return 1
+  printf '%s' "$1"
+}
+
+ui_bind_one() {
+  _a="$1"
+  hr "绑定 — 内置朝鲜 IP"
+  kvp "将绑定" "$_a"
   if ip link show "$DEV" >/dev/null 2>&1; then
-    warn "网卡 $DEV 已存在，只会补上缺的（想重来先选 4 删除）"
+    dim "网卡 $DEV 已存在，只补这一条"
   fi
   echo
-  if ask "创建并绑定？"; then
+  if ask "只绑这一条？"; then
     echo
-    cmd_up
+    cmd_up "$_a"
   else
     printf '  %s已取消%s\n' "$GRA" "$RST"
   fi
@@ -629,9 +645,10 @@ ui_down() {
 ui_help() {
   hr "速查"
   sec "创建"
-  note "  fip                    本菜单（无 TTY 时等同 fip up）"
-  note "  fip up                 建网卡 + 绑内置朝鲜地址组（整段）"
+  note "  fip                    本菜单（无 TTY 时等同按地址提示）"
+  note "  fip up                 选一条内置朝鲜 IP（6 选 1）"
   note "  fip up <地址...>       建网卡 + 绑指定地址 / 段"
+  note "  fip up --all           6 条内置地址全部绑上"
   note "  fip add <地址...>      往已有网卡补地址"
   note "  fip gen6 / gen4        只生成一个段内地址并打印（不绑）"
 
@@ -646,12 +663,10 @@ ui_help() {
   dim "范围   175.45.176.0-175.45.179.255  → 自动换算 CIDR"
   dim "多条   空格或逗号分隔"
 
-  sec "内置朝鲜 IP（菜单 1）"
-  dim "1) 绑整段："
-  for _a in $DEFAULT_ADDRS; do dim "     $_a"; done
-  dim "2) 从 $GEN6_PREFIX::/64 生成一个 /128（完整 8 段）"
-  dim "3) 从 $GEN4_CIDR 生成一个 /32"
+  sec "内置朝鲜 IP（菜单 1：6 选 1）"
+  for _a in $DEFAULT_ADDRS; do dim "  $_a"; done
   echo
+  dim "另可从 $GEN6_PREFIX::/64 生成一个 /128，从 $GEN4_CIDR 生成一个 /32"
   dim "不改探针、不写文件、不设自启；重启后地址会消失"
 }
 
@@ -660,24 +675,37 @@ ui_builtin() {
   while :; do
     ui_clear
     hr "内置朝鲜 IP"
-    kvp "整段" "6 条：4×/32 + /64 + /22"
-    kvp "段内 /128" "$GEN6_PREFIX::/64 里随机取一个"
-    kvp "段内 /32" "$GEN4_CIDR 里随机取一个"
+    dim "选一条绑到 $DEV 上（不是整段全绑）"
     echo
-    item "1" "绑整段（104.29.195.20~23 + /64 + /22）"
-    item "2" "从 $GEN6_PREFIX::/64 生成一个 /128"
-    item "3" "从 $GEN4_CIDR 生成一个 /32"
+    _n=0
+    for _a in $DEFAULT_ADDRS; do
+      _n=$(( _n + 1 ))
+      item "$_n" "$_a"
+    done
+    _g1=$(( _n + 1 ))
+    _g2=$(( _n + 2 ))
+    echo
+    item "$_g1" "从 $GEN6_PREFIX::/64 生成一个 /128"
+    item "$_g2" "从 $GEN4_CIDR 生成一个 /32"
     item "0" "返回主菜单"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-3]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-%s]%s %s:%s ' \
+      "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$_g2" "$RST" "$GRA" "$RST"
     read -r c || return 0
     case "$c" in
-      1) ui_up_default; pause ;;
-      2) ui_up_gen6; pause ;;
-      3) ui_up_gen4; pause ;;
       0|q|Q) return 0 ;;
-      *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
+      "$_g1") ui_up_gen6; pause; continue ;;
+      "$_g2") ui_up_gen4; pause; continue ;;
     esac
+    case "$c" in
+      ''|*[!0-9]*) c=0 ;;
+    esac
+    if [ "$c" -ge 1 ] 2>/dev/null && [ "$c" -le "$_n" ] 2>/dev/null; then
+      ui_bind_one "$(pick_nth "$c" $DEFAULT_ADDRS)"
+    else
+      printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"
+    fi
+    pause
   done
 }
 
@@ -690,7 +718,7 @@ cmd_menu() {
     menu_status
     echo
     printf '   %s┄┄%s %s%s创建%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$SKY_B" "$RST" "$BORD" "$RST"
-    item "1" "创建网卡 · 内置朝鲜 IP（整段 / 段内 /128）"
+    item "1" "创建网卡 · 内置朝鲜 IP（6 选 1 / 段内生成）"
     item "2" "创建网卡 · 自己输入 IP / IP 段"
     echo
     printf '   %s┄┄%s %s%s查看与删除%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$VIO_B" "$RST" "$BORD" "$RST"
@@ -724,8 +752,10 @@ usage() {
   printf 'fip %s — 只做一件事：建网卡，把 IP / IP 段绑上去\n\n' "$VERSION"
   cat <<'EOF'
 用法：
-  fip                       终端里进菜单（无 TTY 时等同 fip up）
-  fip up [地址...]          建网卡并绑地址；不带地址 = 内置朝鲜地址组
+  fip                       终端里进菜单
+  fip up                    选一条内置朝鲜 IP（6 选 1）
+  fip up <地址...>          建网卡并绑指定地址 / 段
+  fip up --all              6 条内置地址全部绑上
   fip add <地址...>         往已有网卡补地址（等同 fip up）
   fip gen6                  打印一个 /128（不绑），可用 fip up $(fip gen6)
   fip gen4                  打印一个 /32（不绑）
@@ -733,10 +763,13 @@ usage() {
   fip down                  删网卡（连同上面的地址）
   fip help / fip version
 
-菜单 1「内置朝鲜 IP」里可以选：
-  1) 绑整段（下面 6 条）
-  2) 从 2606:54c1:1:c4::/64 生成一个 /128（完整 8 段，每次不同）
-  3) 从 175.45.176.0/22 生成一个 /32
+菜单 1「内置朝鲜 IP」是 6 选 1，另加两个生成项：
+  1) 104.29.195.20/32        4) 104.29.195.23/32
+  2) 104.29.195.21/32        5) 2606:54c1:1:c4::/64
+  3) 104.29.195.22/32        6) 175.45.176.0/22
+  7) 从 2606:54c1:1:c4::/64 生成一个 /128（完整 8 段，每次不同）
+  8) 从 175.45.176.0/22 生成一个 /32
+  0) 返回主菜单
 
 地址写法：
   104.29.195.20             单个 IPv4        → 加 /32
@@ -745,14 +778,14 @@ usage() {
   104.29.195.20-104.29.195.23   范围，自动换算成 CIDR
   "1.2.3.4 5.6.7.8"         多个：空格或逗号分隔
 
-内置朝鲜地址组（不带参数时使用）：
+内置朝鲜 IP（菜单 1 的 6 条）：
   104.29.195.20/32  104.29.195.21/32  104.29.195.22/32  104.29.195.23/32
   2606:54c1:1:c4::/64
   175.45.176.0/22
 
 环境变量：
   FIP_DEV=fip0                 网卡名
-  FIP_DEFAULT_ADDRS="..."      内置地址组，空格分隔
+  FIP_DEFAULT_ADDRS="..."      内置 6 条的列表，空格分隔
   FIP_GEN6_PREFIX=2606:54c1:1:c4   /128 生成用的 /64 前缀
   FIP_GEN4_CIDR=175.45.176.0/22    /32 生成用的 IPv4 段
   FIP_NOPREFIXROUTE=0          关掉 noprefixroute（会向路由表加直连路由）
@@ -765,22 +798,46 @@ usage() {
   * 需要 root / CAP_NET_ADMIN。
 
 安装：
-  install -m 755 fip-v0.3.sh /usr/local/bin/fip
+  install -m 755 fip-v0.4.sh /usr/local/bin/fip
 EOF
+}
+
+# 没给地址时打印 6 条候选
+no_addr_hint() {
+  err "没给地址"
+  dim "内置朝鲜 IP（选一条）："
+  _n=0
+  for _a in $DEFAULT_ADDRS; do
+    _n=$(( _n + 1 ))
+    dim "  $_n) $_a"
+  done
+  echo
+  dim "用法：fip up <地址>       生成：fip gen6 / fip gen4"
+  dim "     6 条全绑：fip up --all"
 }
 
 case "${1:-}" in
   '' )
       if [ -t 0 ] && [ -t 1 ] && [ "${FIP_MENU:-1}" != "0" ]; then
         cmd_menu
+      elif [ "${FIP_MENU:-1}" = "0" ]; then
+        cmd_up_all
       else
-        cmd_up
+        no_addr_hint
+        exit 1
       fi
       ;;
   menu|ui|tui|interactive|-i)      cmd_menu ;;
   gen6|v6|rnd6)                     gen_v6_128 ;;
   gen4|v4|rnd4)                     gen_v4_32 ;;
-  up|on|create|new)                 shift; cmd_up "$@" ;;
+  up|on|create|new)
+      shift
+      case "${1:-}" in
+        --all|all) cmd_up_all ;;
+        '')        if [ -t 0 ] && [ -t 1 ]; then ui_builtin; else no_addr_hint; exit 1; fi ;;
+        *)         cmd_up "$@" ;;
+      esac
+      ;;
   add|append)                       shift; cmd_up "$@" ;;
   down|off|del|delete|rm|remove)    cmd_down ;;
   status|show|stat|ls)              cmd_status ;;
