@@ -16,6 +16,8 @@
 #                排除法：kp nic off --exclude（排掉带 IPv4 的网卡，如 eth0）
 #   kp block     iptables 硬性禁止 IPv4 出站
 #   kp unblock   撤除封堵
+#   kp fakeip [IP]  建一张假 IP 网卡并让探针只监控它（面板显示该 IP 归属地）
+#   kp fakeip off   删除网卡并恢复探针配置
 #   kp status    查看当前网络状态
 #   kp help
 #
@@ -29,7 +31,7 @@
 set -u
 
 # ── 版本与更新源 ────────────────────────────────────────
-VERSION="1.6.2"
+VERSION="1.7.0"
 SELF="${0:-kp}"
 RAW_URL="https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh"
 CDN_URL="https://cdn.jsdelivr.net/gh/87954621/lxcV6@main/kp.sh"
@@ -962,33 +964,44 @@ probe_kind() {
   case "$KP_PROBE" in
     komari|nezha) printf '%s' "$KP_PROBE"; return ;;
   esac
-  # 哪吒 v2：配置文件或服务单元
+  # ① 先看进程 —— 唯一可信的运行时事实。
+  #    （配置文件/目录可能是卸载后的残留，比如换过探针）
+  if ps ax 2>/dev/null | grep -v grep | grep -qi 'nezha-agent'; then
+    printf 'nezha'; return
+  fi
+  if ps ax 2>/dev/null | grep -v grep | grep -qi 'komari'; then
+    printf 'komari'; return
+  fi
+  # ② 再看服务单元
+  if have_systemd; then
+    systemctl list-unit-files 2>/dev/null | grep -q '^nezha-agent' && { printf 'nezha'; return; }
+    systemctl list-unit-files 2>/dev/null | grep -q '^komari-agent' && { printf 'komari'; return; }
+  fi
+  [ -f /etc/init.d/nezha-agent ]  && { printf 'nezha';  return; }
+  [ -f /etc/init.d/komari-agent ] && { printf 'komari'; return; }
+  # ③ 最后才看文件/目录存在性（可能是残留）
   for f in /opt/nezha/agent/config.yml /etc/nezha/config.yml; do
     [ -f "$f" ] && { printf 'nezha'; return; }
   done
-  if have_systemd; then
-    systemctl list-unit-files 2>/dev/null | grep -q '^nezha-agent' && { printf 'nezha'; return; }
-  fi
-  [ -f /etc/init.d/nezha-agent ] && { printf 'nezha'; return; }
-  # Komari
-  for f in /opt/komari/komari-agent /usr/local/bin/komari-agent; do
+  for f in /opt/komari/komari-agent /usr/local/bin/komari-agent /opt/komari; do
     [ -e "$f" ] && { printf 'komari'; return; }
   done
-  if have_systemd; then
-    systemctl list-unit-files 2>/dev/null | grep -q '^komari-agent' && { printf 'komari'; return; }
-  fi
-  # 进程兜底
-  if ps ax 2>/dev/null | grep -v grep | grep -qi 'nezha-agent'; then printf 'nezha'; return; fi
-  if ps ax 2>/dev/null | grep -v grep | grep -qi 'komari'; then printf 'komari'; return; fi
   printf 'komari'
 }
 
 # 哪吒 v2 的 agent 配置文件（多个则取第一个存在的）
 nezha_conf() {
+  # ① 最常见路径
   for f in /opt/nezha/agent/config.yml /etc/nezha/config.yml /opt/nezha/agent/config.yaml; do
     [ -f "$f" ] && { printf '%s' "$f"; return 0; }
   done
-  # 兜底：从服务单元里找 -c 指定的配置
+  # ② 从进程命令行抠 -c 指定的路径（最准，跟实际跑的一致）
+  P="$(ps ax 2>/dev/null | grep -v grep | grep 'nezha-agent' | head -1)"
+  if [ -n "$P" ]; then
+    CF="$(printf '%s' "$P" | grep -oE '\-c[= ][^ ]+\.ya?ml' | head -1 | sed -E 's/^-c[= ]//')"
+    [ -n "$CF" ] && [ -f "$CF" ] && { printf '%s' "$CF"; return 0; }
+  fi
+  # ③ 从服务单元里找
   for u in /etc/systemd/system/nezha-agent.service /lib/systemd/system/nezha-agent.service \
            /etc/systemd/system/nezha-agent@.service /etc/init.d/nezha-agent; do
     [ -f "$u" ] || continue
@@ -1115,6 +1128,8 @@ norm_nic() { sed 's/@.*//'; }
 
 # 有全局 IPv6 的网卡名（双栈网卡也包含，仅用于展示）—— 空格分隔带尾空格
 v6_nics() {
+  # kp fakeip 期间临时覆盖成那张假网卡，复用 cmd_nic 的全部配置逻辑
+  [ -n "${KP_FAKE_NICS:-}" ] && { printf '%s ' "$KP_FAKE_NICS"; return 0; }
   nics_scan
   [ -n "$KP_V6" ] || return 0
   _o=""; for _n in $(printf '%s' "$KP_V6" | tr ',' ' '); do _o="$_o$_n "; done
@@ -1132,7 +1147,10 @@ v6only_nics() {
 }
 
 # 逗号分隔的形态（Komari include_nics 用）—— 只含纯 IPv6 网卡
-v6_nics_csv() { nics_scan; printf '%s' "$KP_V6ONLY"; }
+v6_nics_csv() {
+  [ -n "${KP_FAKE_NICS:-}" ] && { printf '%s' "$KP_FAKE_NICS"; return 0; }
+  nics_scan; printf '%s' "$KP_V6ONLY";
+}
 
 # 有全局 IPv4 的网卡（exclude_nics 用）—— 空格分隔带尾空格
 v4_nics() {
@@ -1601,6 +1619,293 @@ EOF
   dim "验证：ps -ef | grep $AGENT | grep -o -- '--(include|exclude)-nics[= ][^ ]*'"
 }
 
+# ── 伪造 IP 网卡（让探针上报指定归属地的地址）──────────────
+# 建一张 dummy 网卡绑指定公网 IP，再让探针只监控这张网卡，
+# 面板查 GeoIP 时就会按这个 IP 显示归属地。
+# 只影响「上报值」：地址不可达、不参与路由，外部服务看到的仍是真实出口 IP；
+# 面板若反查 gRPC 连接来源 IP，也可能覆盖这里的上报值。
+KP_FAKE_NICS=""
+FAKE_DEV="kp0"
+FAKE_IP_DEFAULT="31.6.16.15"          # KP / Pyongyang
+FAKE_CONF="/etc/kp-fakeip.conf"
+FAKE_UP="/usr/local/sbin/kp-fakeip-up"
+FAKE_LOCAL="/etc/local.d/kp-fakeip.start"
+FAKE_UNIT="/etc/systemd/system/kp-fakeip.service"
+FAKE_RC="/etc/rc.local"
+
+fakeip_prefix() { case "$1" in *:*) printf '128' ;; *) printf '32' ;; esac; }
+
+# 只放行「数字+点」的 IPv4 或「含冒号」的 IPv6，剩下交给 ip 命令自己校验
+fakeip_valid_ip() {
+  case "$1" in ''|*[!0-9a-fA-F.:]*) return 1 ;; esac
+  case "$1" in *:*) return 0 ;; esac
+  _oifs="$IFS"; IFS='.'
+  set -- $1
+  IFS="$_oifs"
+  [ "$#" -eq 4 ] || return 1
+  for _seg in "$@"; do
+    case "$_seg" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_seg" -le 255 ] 2>/dev/null || return 1
+  done
+  return 0
+}
+
+fakeip_load() {
+  FIP=""; FMASK=""; FDEV=""; FTYPE=""
+  [ -f "$FAKE_CONF" ] || return 1
+  . "$FAKE_CONF" 2>/dev/null || return 1
+  FIP="${FAKE_IP:-}"; FMASK="${FAKE_MASK:-}"; FDEV="${FAKE_DEV_USED:-$FAKE_DEV}"
+  FTYPE="${FAKE_TYPE:-}"
+  [ -n "$FIP" ] || return 1
+  [ -n "$FMASK" ] || FMASK="$(fakeip_prefix "$FIP")"
+  return 0
+}
+
+fakeip_write_conf() {
+  IP="$1"; MASK="$2"; DEV="$3"; TYPE="$4"
+  cat > "$FAKE_CONF" <<EOF
+# kp fakeip 配置（由 kp 生成，可手改）
+FAKE_IP="$IP"
+FAKE_MASK="$MASK"
+FAKE_DEV_USED="$DEV"
+FAKE_TYPE="$TYPE"
+EOF
+  chmod 644 "$FAKE_CONF" 2>/dev/null
+}
+
+# 自启动脚本：不依赖 kp.sh，重启后自己把网卡建回来
+fakeip_write_up() {
+  IP="$1"; MASK="$2"; DEV="$3"
+  mkdir -p "$(dirname "$FAKE_UP")" 2>/dev/null
+  cat > "$FAKE_UP" <<EOF
+#!/bin/sh
+# kp 生成：重启后重建伪造 IP 网卡，不依赖 kp.sh
+ip link show $DEV >/dev/null 2>&1 || {
+  ip link add $DEV type dummy 2>/dev/null || \\
+  ip link add $DEV type veth peer name ${DEV}p 2>/dev/null || exit 1
+}
+ip -o addr show dev $DEV 2>/dev/null | grep -qF ' $IP/$MASK ' || \\
+  ip addr add $IP/$MASK dev $DEV scope global 2>/dev/null
+ip link set $DEV up 2>/dev/null
+exit 0
+EOF
+  chmod +x "$FAKE_UP" 2>/dev/null
+}
+
+fakeip_up() {
+  IP="$1"; MASK="$2"; DEV="$3"
+  TYPE=""
+  if ip link show "$DEV" >/dev/null 2>&1; then
+    TYPE="existing"
+  elif ip link add "$DEV" type dummy 2>/dev/null; then
+    TYPE="dummy"
+  elif ip link add "$DEV" type veth peer name "${DEV}p" 2>/dev/null; then
+    TYPE="veth"
+  else
+    err "建不了虚拟网卡（容器多半缺 CAP_NET_ADMIN 或 dummy 模块）"
+    dim "退路：直接绑到 lo，再让探针监控 lo"
+    dim "  ip addr add $IP/$MASK dev lo scope global"
+    return 1
+  fi
+
+  # 已存在同名地址时 ip addr add 会报 File exists，确认还在就算成功
+  if ! ip addr add "$IP/$MASK" dev "$DEV" scope global 2>/dev/null; then
+    if ! ip -o addr show dev "$DEV" 2>/dev/null | grep -qF " $IP/$MASK "; then
+      err "绑地址失败：$IP/$MASK"
+      case "$TYPE" in dummy|veth) ip link del "$DEV" 2>/dev/null ;; esac
+      return 1
+    fi
+  fi
+  ip link set "$DEV" up 2>/dev/null
+  kvp "虚拟网卡" "$DEV（$TYPE）"
+  kvp "绑定地址" "$IP/$MASK"
+  FAKE_LAST_TYPE="$TYPE"
+  return 0
+}
+
+fakeip_persist_on() {
+  IP="$1"; MASK="$2"; D="$3"
+  case "$(init_kind)" in
+    openrc)
+      mkdir -p "$(dirname "$FAKE_LOCAL")" 2>/dev/null
+      printf '#!/bin/sh\n# kp fakeip\n%s\n' "$FAKE_UP" > "$FAKE_LOCAL"
+      chmod +x "$FAKE_LOCAL" 2>/dev/null
+      rc-update add local default >/dev/null 2>&1
+      kvp "持久化" "$FAKE_LOCAL"
+      dim "已注册 OpenRC local 服务，重启自动重建网卡"
+      ;;
+    systemd)
+      cat > "$FAKE_UNIT" <<EOF
+[Unit]
+Description=kp fake IP interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$FAKE_UP
+ExecStop=/bin/sh -c "ip link del $D"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload 2>/dev/null
+      systemctl enable kp-fakeip.service >/dev/null 2>&1
+      kvp "持久化" "$FAKE_UNIT"
+      ;;
+    *)
+      if [ -f "$FAKE_RC" ]; then
+        if ! grep -qF "$FAKE_UP" "$FAKE_RC" 2>/dev/null; then
+          cp -a "$FAKE_RC" "$FAKE_RC.kp.bak.$(date +%s)" 2>/dev/null
+          awk -v cmd="$FAKE_UP" '
+            /^[[:space:]]*exit([[:space:]]|$)/ && !d { print cmd; d=1 }
+            { print }
+            END { if (!d) print cmd }
+          ' "$FAKE_RC" > "$FAKE_RC.tmp" 2>/dev/null && mv "$FAKE_RC.tmp" "$FAKE_RC"
+          chmod +x "$FAKE_RC" 2>/dev/null
+        fi
+        kvp "持久化" "$FAKE_RC（追加一行）"
+      else
+        warn "没识别出 init 系统，也没找到 $FAKE_RC"
+        dim "重启后需手动跑：$FAKE_UP"
+      fi
+      ;;
+  esac
+}
+
+fakeip_persist_off() {
+  [ -f "$FAKE_LOCAL" ] && { rm -f "$FAKE_LOCAL"; kvp "移除" "$FAKE_LOCAL"; }
+  if [ -f "$FAKE_UNIT" ]; then
+    systemctl disable kp-fakeip.service >/dev/null 2>&1
+    rm -f "$FAKE_UNIT"
+    systemctl daemon-reload 2>/dev/null
+    kvp "移除" "$FAKE_UNIT"
+  fi
+  if [ -f "$FAKE_RC" ] && grep -qF "$FAKE_UP" "$FAKE_RC" 2>/dev/null; then
+    grep -vF "$FAKE_UP" "$FAKE_RC" > "$FAKE_RC.tmp" 2>/dev/null && mv "$FAKE_RC.tmp" "$FAKE_RC"
+    chmod +x "$FAKE_RC" 2>/dev/null
+    kvp "清理" "$FAKE_RC"
+  fi
+  [ -f "$FAKE_UP" ]   && { rm -f "$FAKE_UP";   kvp "移除" "$FAKE_UP"; }
+  [ -f "$FAKE_CONF" ] && { rm -f "$FAKE_CONF"; kvp "移除" "$FAKE_CONF"; }
+  return 0
+}
+
+cmd_fakeip_on() {
+  IP="${1:-}"
+  [ -z "$IP" ] && IP="$FAKE_IP_DEFAULT"
+  if ! fakeip_valid_ip "$IP"; then
+    res "IP 格式不对：$IP" "$RED"
+    dim "支持 IPv4（如 31.6.16.15）或 IPv6（如 2401:5000::1）"
+    return 1
+  fi
+  MASK="$(fakeip_prefix "$IP")"
+  DEV="$FAKE_DEV"
+
+  hrt "伪造 IP 网卡"
+  dim "让探针只上报这张网卡上的地址，面板按它查归属地"
+  dim "地址不可达、不参与路由，外部服务仍看到真实出口 IP"
+  echo
+
+  hr "创建网卡"
+  FAKE_LAST_TYPE=""
+  fakeip_up "$IP" "$MASK" "$DEV" || return 1
+  TYPE="$FAKE_LAST_TYPE"
+
+  hr "持久化"
+  fakeip_write_up "$IP" "$MASK" "$DEV"
+  fakeip_persist_on "$IP" "$MASK" "$DEV"
+  fakeip_write_conf "$IP" "$MASK" "$DEV" "$TYPE"
+
+  hr "让探针只监控这张网卡"
+  KP_FAKE_NICS="$DEV"          # 让 v6_nics()/v6_nics_csv() 临时返回 kp0
+  cmd_nic off include
+  RC=$?
+  KP_FAKE_NICS=""
+  [ "$RC" -eq 0 ] || warn "探针配置没写成，网卡已建好，可手动把白名单设为 $DEV"
+
+  echo
+  hr "完成"
+  kvp "面板上报 IP" "$IP"
+  kvp "监控网卡" "$DEV"
+  dim "面板不会立刻刷新（哪吒 ip_report_period 默认 1800 秒）"
+  dim "若面板同时显示连接来源的真实 IP，或 GeoIP 库不认这个段，可能不显示目标国家"
+  dim "关闭并还原：kp fakeip off"
+  return 0
+}
+
+cmd_fakeip_off() {
+  hrt "关闭伪造 IP 网卡"
+  if ! fakeip_load; then
+    dim "没有 kp fakeip 的配置记录"
+    if ip link show "$FAKE_DEV" >/dev/null 2>&1; then
+      ip link del "$FAKE_DEV" 2>/dev/null && ok "已删除残留网卡 $FAKE_DEV"
+    else
+      dim "没有找到 $FAKE_DEV，无需清理"
+    fi
+    fakeip_persist_off
+    return 0
+  fi
+
+  hr "删除网卡"
+  if ip link show "$FDEV" >/dev/null 2>&1; then
+    if ip link del "$FDEV" 2>/dev/null; then ok "已删除 $FDEV"
+    else err "删除失败（可手动：ip link del $FDEV）"; fi
+  else
+    dim "$FDEV 本来就不存在"
+  fi
+
+  hr "清理持久化"
+  fakeip_persist_off
+
+  hr "恢复探针配置"
+  KP_FAKE_NICS=""
+  cmd_nic on include
+
+  echo
+  hr "完成"
+  dim "探针恢复监控全部网卡；若之前有自定义白名单，从 .kp.bak.* 备份里取回"
+  return 0
+}
+
+cmd_fakeip_status() {
+  hrt "伪造 IP 网卡状态"
+  if fakeip_load; then
+    kvp "配置 IP" "$FIP/$FMASK"
+    kvp "网卡" "$FDEV（$FTYPE）"
+  else
+    kvp "当前状态" "未启用"
+  fi
+  echo
+  hr "$FAKE_DEV 上的地址"
+  if ip link show "$FAKE_DEV" >/dev/null 2>&1; then
+    ip -o addr show dev "$FAKE_DEV" 2>/dev/null
+  else
+    dim "$FAKE_DEV 不存在"
+  fi
+  echo
+  hr "探针当前过滤"
+  CUR="$(nic_now)"
+  [ -n "$CUR" ] && kvp "当前过滤" "$CUR" || kvp "当前过滤" "未设置（监控全部网卡）"
+  echo
+  hr "持久化文件"
+  for f in "$FAKE_UP" "$FAKE_LOCAL" "$FAKE_UNIT"; do
+    [ -f "$f" ] && kvp "已存在" "$f"
+  done
+  return 0
+}
+
+cmd_fakeip() {
+  ACT="${1:-on}"
+  case "$ACT" in
+    off|del|delete|clean|remove|down) cmd_fakeip_off ;;
+    status|show|list|stat) cmd_fakeip_status ;;
+    on|up) cmd_fakeip_on "${2:-}" ;;
+    *) cmd_fakeip_on "$ACT" ;;
+  esac
+}
+
 # ── 检查更新 ────────────────────────────────────────────
 fetch_url() {
   if command -v curl >/dev/null 2>&1; then
@@ -1770,13 +2075,14 @@ menu_status() {
 
   # ── 探针 ──
   bar
+  PNAME="$(unit_name)"
   printf '%s%s%s %s探针%s ' "$SKY_B" "◈" "$RST" "$GRA" "$RST"
   case "$(probe_state)" in
-    run)  printf '%s ' "$(dot_on)";  printf '%s%s%s' "$BOLD_W" "$AGENT" "$RST"
+    run)  printf '%s ' "$(dot_on)";  printf '%s%s%s' "$BOLD_W" "$PNAME" "$RST"
           printf ' %s' "$(st_badge "$BGRN" "运行中")" ;;
-    stop) printf '%s ' "$(dot_off)"; printf '%s%s%s' "$BOLD_W" "$AGENT" "$RST"
+    stop) printf '%s ' "$(dot_off)"; printf '%s%s%s' "$BOLD_W" "$PNAME" "$RST"
           printf ' %s' "$(st_badge "$BRED" "已停止")" ;;
-    *)    printf '%s ' "$(dot_na)";  printf '%s%s%s' "$GRA"    "$AGENT" "$RST"
+    *)    printf '%s ' "$(dot_na)";  printf '%s%s%s' "$GRA"    "$PNAME" "$RST"
           printf ' %s' "$(st_badge "$GRA" "未安装")" ;;
   esac
   # 上报范围（右侧）
@@ -1946,6 +2252,37 @@ cmd_nic_menu() {
   fi
 }
 
+cmd_fakeip_menu() {
+  hr "伪造 IP 网卡（面板归属地）"
+  if fakeip_load; then
+    kvp "当前 IP" "$FIP/$FMASK"
+    kvp "网卡" "$FDEV"
+  else
+    kvp "当前状态" "未启用"
+  fi
+  echo
+  dim "建一张虚拟网卡绑指定 IP，再让探针只监控它"
+  dim "面板按这个 IP 查归属地；地址本身不可达，不改路由、不出网"
+  echo
+  item "1" "启用（默认 31.6.16.15 · 朝鲜平壤）"
+  item "2" "自定义 IP（IPv4 / IPv6 都行）"
+  item "3" "关闭并清理"
+  item "4" "查看状态"
+  item "0" "返回"
+  echo
+  printf '  %s❯%s %s请选择%s %s[0-4]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+  read -r c || return 0
+  case "$c" in
+    1) cmd_fakeip on ;;
+    2) printf '  IP > '; read -r IP || return 0
+       if [ -n "$IP" ]; then cmd_fakeip on "$IP"; else dim "已取消"; fi ;;
+    3) cmd_fakeip off ;;
+    4) cmd_fakeip status ;;
+    0|'') return 0 ;;
+    *) err "无效选项" ;;
+  esac
+}
+
 cmd_menu() {
   while :; do
     clear 2>/dev/null || true
@@ -1967,14 +2304,16 @@ cmd_menu() {
     echo
     printf '   %s┄┄%s %s%s其他%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$VIO_B" "$RST" "$BORD" "$RST"
     item "9" "检查更新"
+    item "f" "伪造 IP 网卡（改面板显示的归属地）"
     item "0" "退出"
     echo
     printf '  %s┈┈┈%s %s提示%s %s┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈%s\n' "$BORD2" "$RST" "$PINK_B" "$RST" "$BORD2" "$RST"
     dim "第一次用：先 1 看状态，再 2 探测，确认没问题后 3 切换"
     dim "面板显示本机 IPv4：选 7（路由管不了 agent 上报）"
     dim "防止 dhcpcd 续约把 IPv4 装回来：切完记得选 8"
+    dim "想让面板显示别的国家：选 f（只改上报值，不影响出网）"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-9]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-9/f]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
 
     case "$c" in
@@ -1987,6 +2326,7 @@ cmd_menu() {
       7) cmd_nic_menu; pause ;;
       8) cmd_persist on; pause ;;
       9) cmd_update ask; pause ;;
+      f|F) cmd_fakeip_menu; pause ;;
       0) printf '\n  %s再见 👋%s\n\n' "$TEAL_B" "$RST"; exit 0 ;;
       *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
@@ -2016,9 +2356,15 @@ kp — VPS 纯 IPv6 切换 / 探针自救
   kp update check 只检查，不安装
   kp update force 直接安装，不询问
   kp unlock       清理旧版 lockv6 在 /etc/hosts 留下的记录
+  kp fakeip [IP]  建假 IP 网卡并让探针只监控它（默认 31.6.16.15 · 朝鲜平壤）
+  kp fakeip off   删除网卡、清持久化、恢复探针配置
+  kp fakeip status    查看状态
   kp version      显示版本
   kp status       查看当前网络状态
   kp help         帮助
+
+fakeip 只改 agent 上报的地址；GeoIP 归属地取决于面板用的地址库，
+面板若反查连接来源 IP，仍可能显示真实出口地址。
 
 支持的探针（自动识别，也可强制指定）：
   Komari   → get_ip_addr_from_nic + 网卡过滤
@@ -2072,6 +2418,7 @@ case "${1:-}" in
     hr "清理旧版 hosts 锁定"
     clean_old_lockv6 || dim "没有发现旧记录"
     ;;
+  fakeip|fake|kp) cmd_fakeip "${2:-on}" "${3:-}" ;;
   version|-v|--version) echo "kp $VERSION" ;;
   status)    cmd_status ;;
   help|-h|--help) usage ;;
