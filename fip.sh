@@ -1,44 +1,41 @@
 #!/bin/sh
-# fip-v3.0.sh — 假 IPv6 网桥（学 HE 隧道那套：一个 /64、一个网桥、自动分配）
+# fip-v3.2.sh — 只造假网桥：一段假 /64 + 假 IPv4 池，容器/地址分配交给面板
 #
-# 思路只有四步，和 HE tunnelbroker 拿到 /64 之后的做法一样：
+# 和 HE tunnelbroker 一样：你只负责把一段 /64 配到一个网桥上，
+# 后面谁要用（面板 routed、容器挂网卡、你自己 ip addr add）都不归它管。
 #
-#   1. incus network create kp ipv6.address=2606:54c1:1:c4::1/64
-#   2. incus profile device add default kp nic network=kp
-#   3. 容器挂上这张网卡 → 内核收 RA，自己 SLAAC 出地址
-#   4. 需要时只做两件事：开 IPv6、清掉假网桥塞的默认路由
+#   incus network create kp \
+#     ipv4.address=175.45.176.1/22 ipv4.nat=false \
+#     ipv6.address=2606:54c1:1:c4::1/64 ipv6.nat=false
 #
-# 不逐台改容器、不跟面板抢网卡、不写任何文件。
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.0.sh → fip-v3.1.sh）。
+# 本脚本**不碰** profile、不碰容器、不写任何文件。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v3.2.sh → fip-v3.3.sh）。
 #
 # 用法：
 #   fip                菜单
-#   fip up             建/修复网桥 + 挂到 default profile（一条命令）
-#   fip status         网桥 / profile / 每台容器地址
-#   fip check          体检：把当前所有问题列出来
-#   fip fix            修容器（开 IPv6、清假默认路由、等地址）
-#   fip switch <前缀>  换段
+#   fip up [前缀]      建 / 修复网桥
+#   fip status         网桥状态（地址、谁在用）
+#   fip check          体检
+#   fip switch <前缀>  换段（先删再建）
+#   fip down           删网桥
 #   fip presets        原有 6 条内置地址
 #   fip gen6 / gen4    打印一个 /128 或 /32
 #   fip bridge add/del/list   网桥地址（宿主机侧）
-#   fip down           摘 profile + 删网桥
 #   fip help / version
 #
 # 环境变量：
 #   FIP_BRIDGE=kp                网桥（Incus 网络）名
 #   FIP_PREFIX=2606:54c1:1:c4     默认 /64 前缀
 #   FIP_PREFIXES="..."           内置候选前缀
-#   FIP_V4_BRIDGE=175.45.176.1/22 网桥的假 IPv4 池（none = 不开）
-#   FIP_PROFILE=default          自动挂网卡用的 profile
+#   FIP_V4_BRIDGE=175.45.176.1/22 假 IPv4 池（none = 不开）
 #   FIP_COLOR=0                  关颜色
 set -u
 
-VERSION="3.0"
+VERSION="3.2"
 
 BRIDGE="${FIP_BRIDGE:-kp}"
 PREFIX="${FIP_PREFIX:-2606:54c1:1:c4}"
 PREFIXES="${FIP_PREFIXES:-2606:54c1:1:c4 2a14:67c1:a02f 2a12:bec0:160}"
-PROFILE="${FIP_PROFILE:-default}"
 V4_BRIDGE="${FIP_V4_BRIDGE:-175.45.176.1/22}"
 V4_IP="${V4_BRIDGE%%/*}"
 BUILTIN="104.29.195.20/32 104.29.195.21/32 104.29.195.22/32 104.29.195.23/32 2606:54c1:1:c4::/64 175.45.176.0/22"
@@ -197,7 +194,6 @@ valid_ipv6() {
   return 0
 }
 
-
 valid_cidr() {
   _a="$1"; _l=""
   case "$_a" in */*) _l="${_a##*/}"; _a="${_a%%/*}" ;; esac
@@ -310,38 +306,23 @@ gen_v6_128() {
 }
 
 gen_v4_32() {
-  _base="175.45.176.0"
-  _size=1024
   _r="$(rand16 v4)"
-  _n=$(( _r % _size ))
-  _b="$(ip2int "$_base")"
+  _n=$(( _r % 1024 ))
+  _b="$(ip2int "175.45.176.0")"
   printf '%s/32\n' "$(int2ip "$(( _b + _n ))")"
 }
 
-# ── Incus 工具 ───────────────────────────────────────────
-have_incus()  { command -v incus >/dev/null 2>&1; }
-need_incus()  { have_incus || { err "没找到 incus（要在 Incus 宿主机上跑）"; return 1; }; }
-net_obj()     { incus network show "$BRIDGE" >/dev/null 2>&1; }
-net_dev()     { ip link show "$BRIDGE" >/dev/null 2>&1; }
+# ── Incus 网桥 ───────────────────────────────────────────
+have_incus() { command -v incus >/dev/null 2>&1; }
+need_incus() { have_incus || { err "没找到 incus（要在 Incus 宿主机上跑）"; return 1; }; }
+net_obj()    { incus network show "$BRIDGE" >/dev/null 2>&1; }
+net_dev()    { ip link show "$BRIDGE" >/dev/null 2>&1; }
 net_state() {
   if net_obj; then
     if net_dev; then printf 'ok'; else printf 'stale'; fi
   else
     printf 'none'
   fi
-}
-containers()  { incus list -c n,t --format csv 2>/dev/null | awk -F, '$2=="CONTAINER"{print $1}'; }
-has_dev()     { incus config device show "$1" 2>/dev/null | grep -q "network: $BRIDGE"; }
-profile_has_dev() { incus profile device show "$PROFILE" 2>/dev/null | grep -q "network: $BRIDGE"; }
-
-# 容器上还有没有别的设备也连在 kp（面板塞的会在这）
-dup_devs() {
-  incus config device show "$1" 2>/dev/null | awk -v b="$BRIDGE" -v me="$BRIDGE" '
-    /^[A-Za-z0-9_.-]+:$/ { dev=$0; sub(/:$/,"",dev) }
-    /^  (network|parent): / {
-      if ($2 == b && dev != me) print dev
-    }
-  '
 }
 
 cur_prefix() {
@@ -357,50 +338,9 @@ cur_prefix() {
   printf '%s' "$PREFIX"
 }
 
-addr_of() {
-  incus exec "$1" -- ip -6 -o addr show scope global 2>/dev/null |
-    awk '{print $4}' | grep -F "${PREFIX}:" | head -1
-}
-
-addr_v4_of() {
-  _pfx="$(printf '%s' "$V4_IP" | awk -F. '{print $1"."$2}')"
-  [ -n "$_pfx" ] || return 0
-  incus exec "$1" -- ip -4 -o addr show scope global 2>/dev/null |
-    awk '{print $4}' | grep -F "${_pfx}." | head -1
-}
-
-
-# 开 IPv6 + 清掉假网桥塞的默认路由
-fix_container() {
-  incus exec "$1" -- sh -c '
-    for i in /sys/class/net/*; do
-      n="${i##*/}"
-      case "$n" in lo|eth0) continue ;; esac
-      sysctl -w "net.ipv6.conf.$n.disable_ipv6=0" >/dev/null 2>&1 || \
-        echo 0 > "/proc/sys/net/ipv6/conf/$n/disable_ipv6" 2>/dev/null
-      sysctl -w "net.ipv6.conf.$n.accept_ra=2" >/dev/null 2>&1
-      sysctl -w "net.ipv6.conf.$n.autoconf=1" >/dev/null 2>&1
-      ip link set "$n" up 2>/dev/null
-    done
-  ' >/dev/null 2>&1
-  if [ -n "$V4_IP" ] && [ "$V4_IP" != "none" ]; then
-    incus exec "$1" -- ip -4 route del default via "$V4_IP" >/dev/null 2>&1
-  fi
-  return 0
-}
-
-wait_addrs() {
-  _i=0
-  while [ "$_i" -lt 10 ]; do
-    _left=0
-    for _c in $(containers); do
-      [ -n "$(addr_of "$_c")" ] || _left=$(( _left + 1 ))
-    done
-    [ "$_left" -eq 0 ] && return 0
-    sleep 1
-    _i=$(( _i + 1 ))
-  done
-  return 0
+# 谁在用这张网络（只读，用来提示，不动它们）
+used_by() {
+  incus network show "$BRIDGE" 2>/dev/null | sed -n '/^used_by:/,$p' | grep '^- ' | sed 's/^-  *//'
 }
 
 # ── 命令 ─────────────────────────────────────────────────
@@ -409,14 +349,17 @@ cmd_up() {
   _want="$(norm_prefix "${1:-$PREFIX}")"
   valid_prefix "$_want" || { err "前缀不对：$_want"; return 1; }
 
-  hr "启用假 IPv6 网桥"
-  dim "一个 /64、一个网桥、一个 profile —— 和 HE 那套一样"
+  hr "建假网桥"
+  dim "只造桥：${_want}::/64 + $V4_BRIDGE；容器怎么用不归它管"
 
-  # 悬空（对象在、设备不在）先拆
   if [ "$(net_state)" = "stale" ]; then
-    warn "Incus 里有 $BRIDGE，但 Linux 设备不在，先清理"
-    cmd_down >/dev/null 2>&1 || true
-    sleep 1
+    warn "Incus 里有 $BRIDGE，但 Linux 设备不在，先删掉对象再建"
+    if ! incus network delete "$BRIDGE" >/dev/null 2>&1; then
+      err "删不掉，还有东西在用："
+      used_by | sed 's/^/    /'
+      dim "先在面板/容器上摘掉这张网卡，再 fip up"
+      return 1
+    fi
   fi
 
   if net_obj; then
@@ -426,68 +369,28 @@ cmd_up() {
       dim "换段：fip switch $_want"
       return 1
     fi
-    dim "网桥 $BRIDGE 已存在（$_cur），跳过创建"
-  elif incus network create "$BRIDGE" ipv4.address="$V4_BRIDGE" ipv4.nat=false \
+    ok "网桥 $BRIDGE 已存在（$_cur::/64），不用重建"
+    return 0
+  fi
+
+  if incus network create "$BRIDGE" ipv4.address="$V4_BRIDGE" ipv4.nat=false \
        ipv6.address="${_want}::1/64" ipv6.nat=false >/dev/null 2>&1; then
-    ok "已建网桥 $BRIDGE（${_want}::1/64 + $V4_BRIDGE）"
+    ok "已建网桥 $BRIDGE"
+    kvp "IPv6" "${_want}::1/64"
+    kvp "IPv4" "$V4_BRIDGE"
+    echo
+    dim "后面怎么用都行：面板 routed（父接口填 $BRIDGE）、容器加网卡、或 fip bridge add"
   else
     err "建网桥失败"
     dim "手动：incus network create $BRIDGE ipv4.address=$V4_BRIDGE ipv6.address=${_want}::1/64"
     return 1
   fi
-
-  echo
-  if profile_has_dev; then
-    dim "profile $PROFILE 已挂着 $BRIDGE"
-  elif incus profile device add "$PROFILE" "$BRIDGE" nic network="$BRIDGE" >/dev/null 2>&1; then
-    ok "profile $PROFILE 挂上 $BRIDGE（新建容器自动带）"
-  else
-    warn "profile $PROFILE 挂载失败"
-  fi
-
-  echo
-  hr "容器"
-  _n=0
-  for _c in $(containers); do
-    _n=$(( _n + 1 ))
-    if has_dev "$_c"; then
-      dim "$_c  已挂着 $BRIDGE"
-      continue
-    fi
-    _d="$(dup_devs "$_c")"
-    if [ -n "$_d" ]; then
-      warn "$_c  已有设备 $_d 也连在 $BRIDGE 上，跳过（会触发 DNS 冲突）"
-      dim "      处理：incus config device remove $_c $_d"
-      continue
-    fi
-    if incus config device add "$_c" "$BRIDGE" nic network="$BRIDGE" >/dev/null 2>&1; then
-      ok "$_c  挂上 $BRIDGE"
-      sleep 1
-    else
-      warn "$_c  挂载失败"
-    fi
-  done
-  [ "$_n" -eq 0 ] && dim "没有容器"
-
-  echo
-  dim "等容器收 RA（最多 10 秒）…"
-  wait_addrs
-
-  hr "结果"
-  for _c in $(containers); do
-    _a="$(addr_of "$_c")"; _a4="$(addr_v4_of "$_c")"
-    kvp "$_c" "${_a4:-无 v4}  ${_a:-无 v6}"
-  done
-  echo
-  dim "新建容器自动带 $BRIDGE；开机自己 SLAAC，不用逐台操作"
   return 0
 }
 
 cmd_status() {
   need_incus || return 1
-  hrt "FIP 状态"
-
-  hr "网桥"
+  hrt "网桥状态"
   case "$(net_state)" in
     ok)
       kvp "名称" "$BRIDGE"
@@ -495,50 +398,38 @@ cmd_status() {
       _h4="$(ip -4 -o addr show dev "$BRIDGE" scope global 2>/dev/null | awk '{print $4}' | head -1)"
       kvp "IPv6" "${_h:-无}"
       kvp "IPv4" "${_h4:-无}"
+      echo
+      hr "网桥上的地址"
+      ip -o addr show dev "$BRIDGE" 2>/dev/null | awk '{print "  " $3 "  " $4}'
+      echo
+      hr "谁在用（只读）"
+      _u="$(used_by)"
+      if [ -n "$_u" ]; then
+        printf '%s\n' "$_u" | sed 's/^/    /'
+        dim "这些是引用该网络的 profile / 容器；脚本不会动它们"
+      else
+        dim "没有"
+      fi
       ;;
     stale)
       kvp "名称" "$BRIDGE"
-      dim "Incus 有对象、Linux 设备不在 → fip up 会自动重建"
+      dim "Incus 有对象，Linux 设备不在 → fip up 会删掉重建"
       ;;
     *) dim "未建（fip up）" ;;
   esac
-
-  hr "profile"
-  if profile_has_dev; then
-    kvp "$PROFILE" "已挂 $BRIDGE（新建容器自动带）"
-  else
-    dim "$PROFILE 没挂 $BRIDGE"
-  fi
-
-  hr "容器"
-  _n=0
-  for _c in $(containers); do
-    _n=$(( _n + 1 ))
-    _a="$(addr_of "$_c")"; _a4="$(addr_v4_of "$_c")"
-    _d="$(dup_devs "$_c")"
-    if has_dev "$_c"; then
-      kvp "$_c" "${_a4:-无 v4}  ${_a:-无 v6}"
-    elif [ -n "$_d" ]; then
-      kvp "$_c" "重复网卡 $_d（面板也挂了一张）"
-    else
-      dim "$_c  未挂载"
-    fi
-  done
-  [ "$_n" -eq 0 ] && dim "没有容器"
   return 0
 }
 
-# 体检：一条条列出问题
 cmd_check() {
   need_incus || return 1
   hr "体检"
   _bad=0
-
   case "$(net_state)" in
-    ok) ok "网桥 $BRIDGE 正常" ;;
+    ok)
+      ok "网桥 $BRIDGE 设备正常" ;;
     stale)
       err "网桥 $BRIDGE：Incus 有对象，Linux 设备不在"
-      dim "  修：fip up（会自动重建）"
+      dim "  修：fip up"
       _bad=$(( _bad + 1 )) ;;
     *)
       warn "网桥 $BRIDGE 未建"
@@ -546,77 +437,42 @@ cmd_check() {
       _bad=$(( _bad + 1 )) ;;
   esac
 
-  if profile_has_dev; then
-    ok "profile $PROFILE 已挂 $BRIDGE"
-  else
-    warn "profile $PROFILE 没挂 $BRIDGE（新建容器不会自动带）"
-    dim "  修：fip up"
-    _bad=$(( _bad + 1 ))
+  if [ "$(net_state)" = "ok" ]; then
+    _cp="$(cur_prefix)"
+    if ip -6 -o addr show dev "$BRIDGE" scope global 2>/dev/null | grep -qF "${_cp}::1"; then
+      ok "IPv6 段在（${_cp}::/64）"
+    else
+      warn "网桥上没看到 ${_cp}::1，检查前缀"
+      _bad=$(( _bad + 1 ))
+    fi
+    if ps ax 2>/dev/null | grep -v grep | grep -q 'dnsmasq'; then
+      ok "dnsmasq 在跑（RA/DHCP 有人发）"
+    else
+      warn "没看到 dnsmasq，容器可能收不到 RA"
+      _bad=$(( _bad + 1 ))
+    fi
   fi
-
-  for _c in $(containers); do
-    _d="$(dup_devs "$_c")"
-    if [ -n "$_d" ]; then
-      err "$_c：$_d 也连在 $BRIDGE 上（DNS 冲突、DHCP 会反复 DECLINE）"
-      dim "  修：incus config device remove $_c $_d"
-      _bad=$(( _bad + 1 ))
-    fi
-    if ! has_dev "$_c"; then
-      [ -n "$_d" ] || { warn "$_c：没挂 $BRIDGE"; _bad=$(( _bad + 1 )); }
-      continue
-    fi
-    _a="$(addr_of "$_c")"
-    if [ -z "$_a" ]; then
-      warn "$_c：网卡在，但还没假地址"
-      dim "  修：fip fix"
-      _bad=$(( _bad + 1 ))
-    fi
-  done
 
   echo
-  if [ "$_bad" -eq 0 ]; then
-    ok "一切正常"
-  else
-    warn "共 $_bad 项要处理"
-  fi
-  return 0
-}
-
-cmd_fix() {
-  need_incus || return 1
-  hr "修容器"
-  dim "开非 eth0 网卡的 IPv6、清掉假网桥塞的默认路由，再等 10 秒"
-  for _c in $(containers); do
-    fix_container "$_c"
-  done
-  wait_addrs
-  for _c in $(containers); do
-    _a="$(addr_of "$_c")"; _a4="$(addr_v4_of "$_c")"
-    kvp "$_c" "${_a4:-无 v4}  ${_a:-无 v6}"
-  done
+  [ "$_bad" -eq 0 ] && ok "一切正常" || warn "共 $_bad 项要处理"
   return 0
 }
 
 cmd_down() {
   need_incus || return 1
-  hr "拆除"
-  if profile_has_dev; then
-    incus profile device remove "$PROFILE" "$BRIDGE" >/dev/null 2>&1 &&
-      ok "profile $PROFILE 摘除 $BRIDGE"
-  fi
-  for _c in $(containers); do
-    incus config device remove "$_c" "$BRIDGE" >/dev/null 2>&1 &&
-      ok "$_c 摘除 $BRIDGE"
-  done
-  if net_obj; then
-    if incus network delete "$BRIDGE" >/dev/null 2>&1; then
-      ok "已删除网桥 $BRIDGE"
-    else
-      err "删除网桥失败（还有网卡在用？）"
-      return 1
-    fi
-  else
+  hr "删网桥"
+  if ! net_obj; then
     dim "网桥 $BRIDGE 不存在"
+    return 0
+  fi
+  if incus network delete "$BRIDGE" >/dev/null 2>&1; then
+    ok "已删除网桥 $BRIDGE"
+  else
+    err "删不掉，还有东西在用："
+    used_by | sed 's/^/    /'
+    echo
+    dim "这个脚本不动容器/profile；先在上面把这张网卡摘掉再来删"
+    return 1
   fi
   return 0
 }
@@ -627,24 +483,9 @@ cmd_switch() {
   [ -n "$_want" ] || { err "用法：fip switch <前缀>"; return 1; }
   valid_prefix "$_want" || { err "前缀不对：$_want"; return 1; }
   if net_obj; then
-    dim "先拆现有网桥（$(cur_prefix)）…"
     cmd_down || return 1
   fi
   cmd_up "$_want"
-}
-
-cmd_presets() {
-  hr "原有 6 条内置地址"
-  _i=0
-  for _a in $BUILTIN; do
-    _i=$(( _i + 1 ))
-    case "$_a" in
-      *:*) kvp "$_i. $_a" "IPv6，网桥已覆盖（RA 自动发）" ;;
-      *)   kvp "$_i. $_a" "IPv4，手绑：fip bridge add $_a" ;;
-    esac
-  done
-  dim "175.45.176.0/22 已是网桥的 IPv4 池，容器 DHCP 自动拿"
-  return 0
 }
 
 cmd_bridge() {
@@ -655,6 +496,7 @@ cmd_bridge() {
       _a="${2:-}"
       [ -n "$_a" ] || { err "用法：fip bridge add <地址/段>"; return 1; }
       valid_cidr "$_a" || { err "地址不对：$_a"; return 1; }
+      net_dev || { err "网桥 $BRIDGE 不在（先 fip up）"; return 1; }
       if ip addr add "$_a" dev "$BRIDGE" 2>/dev/null; then
         ok "$BRIDGE  $_a"
       else
@@ -674,6 +516,20 @@ cmd_bridge() {
       ip -o addr show dev "$BRIDGE" 2>/dev/null | awk '{print "  " $3 "  " $4}' ;;
     *) err "用法：fip bridge [add|del|list]"; return 1 ;;
   esac
+  return 0
+}
+
+cmd_presets() {
+  hr "原有 6 条内置地址"
+  _i=0
+  for _a in $BUILTIN; do
+    _i=$(( _i + 1 ))
+    case "$_a" in
+      *:*) kvp "$_i. $_a" "IPv6 段，网桥已覆盖" ;;
+      *)   kvp "$_i. $_a" "IPv4，手绑：fip bridge add $_a" ;;
+    esac
+  done
+  dim "175.45.176.0/22 已是网桥的 IPv4 池"
   return 0
 }
 
@@ -698,38 +554,38 @@ menu_status() {
   echo
 
   bar
-  printf '%s◈%s %sprofile%s ' "$LIME_B" "$RST" "$GRA" "$RST"
-  if profile_has_dev; then
-    printf '%s %s%s%s %s' "$(dot_on)" "$BOLD_W" "$PROFILE" "$RST" "$(st_badge "$BGRN" "自动挂载")"
-  else
-    printf '%s %s%s%s %s' "$(dot_na)" "$GRA" "$PROFILE" "$RST" "$(st_badge "$GRA" "未挂")"
-  fi
+  printf '%s◈%s %sIPv4%s ' "$LIME_B" "$RST" "$GRA" "$RST"
+  printf '%s%s%s' "$BOLD_W" "$V4_BRIDGE" "$RST"
   echo
 
   bar
-  printf '%s◈%s %s容器%s ' "$TEAL_B" "$RST" "$GRA" "$RST"
-  _t=0; _g=0
-  for _c in $(containers); do
-    _t=$(( _t + 1 ))
-    [ -n "$(addr_of "$_c")" ] && _g=$(( _g + 1 ))
-  done
-  printf '%s%d 台，%d 台有假地址%s' "$BOLD_W" "$_t" "$_g" "$RST"
+  printf '%s◈%s %s引用%s ' "$TEAL_B" "$RST" "$GRA" "$RST"
+  _u="$(used_by)"
+  if [ -n "$_u" ]; then
+    printf '%s%d 个%s' "$BOLD_W" "$(printf '%s\n' "$_u" | wc -l | tr -d ' ')" "$RST"
+  else
+    printf '%s0%s' "$GRA" "$RST"
+  fi
   echo
 }
 
 banner() {
   printf '\n'
   printf '  %s╭──────────────────────────────────────╮%s\n' "$BORD" "$RST"
-  printf '  %s│%s  %s%-36s%s%s│%s\n' "$BORD" "$RST" "$BOLD_W" "fip $VERSION   ·   FAKE IP" "$RST" "$BORD" "$RST"
-  printf '  %s│%s  %s%-36s%s%s│%s\n' "$BORD" "$RST" "$GRA" "a fake /64, like an HE tunnel" "$RST" "$BORD" "$RST"
+  printf '  %s│%s  %s%-36s%s%s│%s\n' "$BORD" "$RST" "$BOLD_W" "fip $VERSION   ·   FAKE BRIDGE" "$RST" "$BORD" "$RST"
+  printf '  %s│%s  %s%-36s%s%s│%s\n' "$BORD" "$RST" "$GRA" "a fake /64 on an Incus bridge" "$RST" "$BORD" "$RST"
   printf '  %s╰──────────────────────────────────────╯%s\n' "$BORD" "$RST"
-  printf '   %s◆%s %sfip%s %s%s%s   %s·%s   %s假网桥 · 自动分配%s\n' \
+  printf '   %s◆%s %sfip%s %s%s%s   %s·%s   %s只造桥 · 不管容器%s\n' \
     "$ORNG_B" "$RST" "$GRA" "$RST" "$BOLD_W" "$VERSION" "$RST" "$GRA" "$RST" "$TEAL_B" "$RST"
 }
 
 ui_prefix() {
-  hr "启用 / 切换前缀"
-  kvp "当前网桥" "$( [ "$(net_state)" = ok ] && printf '%s（%s::/64）' "$BRIDGE" "$(cur_prefix)" || printf '未建' )"
+  hr "建 / 换前缀"
+  if [ "$(net_state)" = ok ]; then
+    kvp "当前" "$BRIDGE（$(cur_prefix)::/64）"
+  else
+    kvp "当前" "未建"
+  fi
   echo
   _i=0
   for _p in $PREFIXES; do
@@ -756,10 +612,9 @@ ui_prefix() {
   esac
   valid_prefix "$_want" || { err "前缀不对：$_want"; return 0; }
 
-  if [ "$(net_state)" = ok ] && [ "$(cur_prefix)" = "$_want" ]; then
-    cmd_up "$_want"
-  elif [ "$(net_state)" != "none" ]; then
-    if ask "网桥现在用的是 $(cur_prefix)，重建成 $_want？"; then
+  _st="$(net_state)"
+  if [ "$_st" = "ok" ] && [ "$(cur_prefix)" != "$_want" ]; then
+    if ask "网桥现在用 $(cur_prefix)，拆了换成 $_want？"; then
       echo
       cmd_switch "$_want"
     else
@@ -776,6 +631,7 @@ ui_manual() {
   dim "例：175.45.176.0/22  或  2606:54c1:1:c4::/64  或  1.2.3.4,5.6.7.8"
   readline "地址（回车取消）：" ""
   [ -n "$UI_IN" ] || { dim "已取消"; return 0; }
+  net_dev || { err "网桥 $BRIDGE 不在（先 fip up）"; return 1; }
   _hadf=0
   case "$-" in *f*) _hadf=1 ;; esac
   [ "$_hadf" = 1 ] || set -f
@@ -784,10 +640,6 @@ ui_manual() {
   IFS="$_o"
   [ "$_hadf" = 1 ] || set +f
   [ "$#" -gt 0 ] || { dim "已取消"; return 0; }
-  if ! net_dev; then
-    err "网桥 $BRIDGE 不在（先 fip up）"
-    return 1
-  fi
   echo
   expand_addrs "$@" || return 1
   for _a in $ADDRS; do
@@ -818,6 +670,7 @@ ui_builtin() {
     [ "$_j" = "$UI_IN" ] && _sel="$_a"
   done
   [ -n "$_sel" ] || { err "无效选择"; return 0; }
+  net_dev || { err "网桥 $BRIDGE 不在（先 fip up）"; return 1; }
   echo
   if ip addr add "$_sel" dev "$BRIDGE" 2>/dev/null; then
     ok "$BRIDGE  $_sel"
@@ -842,27 +695,21 @@ ui_gen() {
 
 ui_help() {
   hr "速查"
-  sec "管理"
-  note "  fip up                 建/修复网桥 $BRIDGE + 挂 profile"
-  note "  fip status             网桥 / profile / 容器地址"
-  note "  fip check              体检，列出所有问题"
-  note "  fip fix                修容器（开 IPv6、清假默认路由）"
+  sec "只造桥"
+  note "  fip up [前缀]          建网桥 $BRIDGE（假 /64 + 假 v4 池）"
+  note "  fip status             网桥地址、谁在引用"
+  note "  fip check              体检"
   note "  fip switch <前缀>      换段"
-  note "  fip down               摘 profile + 删网桥"
+  note "  fip down               删网桥"
 
   sec "工具"
   note "  fip presets            原有 6 条内置地址"
   note "  fip gen6 / gen4        生成 /128 或 /32"
-  note "  fip bridge add/del/list  网桥地址（宿主机侧）"
+  note "  fip bridge add/del/list  网桥地址"
 
-  sec "原理（学 HE 隧道）"
-  dim "网桥 = Incus managed network，dnsmasq 在桥上发 RA"
-  dim "容器挂上这张网卡，内核自己 SLAAC 出地址"
-  dim "新建容器带 profile 就自动有；重启自动回来"
-
-  sec "环境变量"
-  dim "FIP_BRIDGE=$BRIDGE  FIP_PREFIX=$PREFIX"
-  dim "FIP_V4_BRIDGE=$V4_BRIDGE  FIP_PROFILE=$PROFILE"
+  sec "说明"
+  dim "本脚本不建 profile、不碰容器、不写文件"
+  dim "容器怎么拿地址：面板 routed（父接口填 $BRIDGE）、或你自己挂网卡"
 }
 
 cmd_menu() {
@@ -872,34 +719,32 @@ cmd_menu() {
     echo
     menu_status
     echo
-    printf '   %s┄┄%s %s%s管理%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$SKY_B" "$RST" "$BORD" "$RST"
-    item "1" "启用 / 切换前缀（网桥）"
+    printf '   %s┄┄%s %s%s网桥%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$SKY_B" "$RST" "$BORD" "$RST"
+    item "1" "建网桥 / 换前缀"
     item "2" "查看状态"
-    item "3" "体检（列出问题）"
-    item "4" "修复容器（开 IPv6 / 清默认路由）"
+    item "3" "体检"
     echo
-    printf '   %s┄┄%s %s%s工具%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$VIO_B" "$RST" "$BORD" "$RST"
-    item "5" "手动输入 IP / 段（加到网桥）"
-    item "6" "原有 6 条（加到网桥）"
-    item "7" "生成地址（/128 或 /32）"
-    item "8" "拆除（摘 profile + 删网桥）"
+    printf '   %s┄┄%s %s%s地址%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$VIO_B" "$RST" "$BORD" "$RST"
+    item "4" "手动输入 IP / 段（加到网桥）"
+    item "5" "原有 6 条（加到网桥）"
+    item "6" "生成地址（/128 或 /32）"
     echo
     printf '   %s┄┄%s %s%s其他%s %s┄┄%s\n' "$BORD" "$RST" "$BOLD" "$ORNG_B" "$RST" "$BORD" "$RST"
-    item "9" "帮助 / 速查"
+    item "7" "删除网桥"
+    item "8" "帮助 / 速查"
     item "0" "退出"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-9]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-8]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
     case "$c" in
       1) ui_prefix; pause ;;
       2) cmd_status; pause ;;
       3) cmd_check; pause ;;
-      4) cmd_fix; pause ;;
-      5) ui_manual; pause ;;
-      6) ui_builtin; pause ;;
-      7) ui_gen; pause ;;
-      8) if ask "摘掉 profile 和容器上的 $BRIDGE、删除网桥？"; then echo; cmd_down; fi; pause ;;
-      9) ui_help; pause ;;
+      4) ui_manual; pause ;;
+      5) ui_builtin; pause ;;
+      6) ui_gen; pause ;;
+      7) if ask "删除网桥 $BRIDGE？（不动容器）"; then echo; cmd_down; fi; pause ;;
+      8) ui_help; pause ;;
       0) printf '\n  %s再见 👋%s\n\n' "$TEAL_B" "$RST"; exit 0 ;;
       *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
@@ -907,44 +752,42 @@ cmd_menu() {
 }
 
 usage() {
-  printf 'fip %s — 假 IPv6 网桥（学 HE 隧道：一个 /64、一个网桥、自动分配）\n\n' "$VERSION"
+  printf 'fip %s — 只造假网桥（假 /64 + 假 IPv4 池），容器交给面板\n\n' "$VERSION"
   cat <<'EOF'
 用法：
   fip                     菜单（终端）
-  fip up [前缀]           建/修复网桥 + 挂到 default profile
-  fip status              网桥 / profile / 每台容器地址
-  fip check               体检，列出所有问题
-  fip fix                 修容器（开 IPv6、清假默认路由、等地址）
-  fip switch <前缀>       换段（先拆再建）
+  fip up [前缀]           建网桥 kp（默认 2606:54c1:1:c4）
+  fip status              网桥地址、谁在引用（只读）
+  fip check               体检
+  fip switch <前缀>       换段（先删再建）
+  fip down                删网桥
   fip presets             原有 6 条内置地址
   fip gen6 / gen4         打印一个 /128 或 /32
-  fip bridge add <地址>   手动加到网桥（宿主机侧，容器不继承）
+  fip bridge add <地址>   手动加到网桥（宿主机侧）
   fip bridge del/list     删除 / 查看
-  fip down                摘 profile + 删网桥
 
-原理（和 HE 隧道那套一样）：
-  incus network create kp ipv6.address=2606:54c1:1:c4::1/64
-  incus profile device add default kp nic network=kp
+它只做这一件事：
+  incus network create kp \
+    ipv4.address=175.45.176.1/22 ipv4.nat=false \
+    ipv6.address=2606:54c1:1:c4::1/64 ipv6.nat=false
 
-  Incus 的 dnsmasq 在网桥上发 RA；容器挂上后内核自己 SLAAC 出地址。
-  新建容器带 profile 自动有，重启自动回来，不需要逐台 ip addr add。
+不建 profile、不碰容器、不写任何文件。
+容器怎么拿到地址：面板 routed（父接口填 kp）／你自己挂网卡／fip bridge 只影响宿主机。
 
 环境变量：
   FIP_BRIDGE=kp                  网桥（Incus 网络）名
   FIP_PREFIX=2606:54c1:1:c4       默认前缀
   FIP_PREFIXES="..."             内置候选前缀
   FIP_V4_BRIDGE=175.45.176.1/22  假 IPv4 池（none 关）
-  FIP_PROFILE=default            自动挂网卡用的 profile
   FIP_COLOR=0                    关颜色
   FIP_MENU=0                     无参数不进菜单
 
 注意：
-  * 只对 Incus 容器有效。
-  * 别让面板再往同一网络挂卡（会 DNS 冲突 + DHCP DECLINE），用 fip check 能查出来。
   * 宿主机上会多一条 <前缀>::/64 dev kp 的直连路由。
+  * fip down 删不掉时，会打印 used_by；先去面板/容器上摘网卡。
 
 安装：
-  install -m 755 fip-v3.0.sh /usr/local/bin/fip
+  install -m 755 fip-v3.2.sh /usr/local/bin/fip
 EOF
 }
 
@@ -961,7 +804,6 @@ case "${1:-}" in
   switch|rebuild)       cmd_switch "${2:-}" ;;
   status|show|stat)     cmd_status ;;
   check|doctor)         cmd_check ;;
-  fix|fix6)             cmd_fix ;;
   presets|builtin)      cmd_presets ;;
   gen6|v6)              gen_v6_128 ;;
   gen4|v4)              gen_v4_32 ;;
