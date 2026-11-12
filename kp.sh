@@ -25,8 +25,8 @@
 #   PANEL=面板域名   额外检查面板域名能否解析出 AAAA
 #   KP_PROBE=        komari|nezha，强制指定探针种类（默认 auto）
 #
-# 安装：
-#   wget -qO /usr/local/bin/kp https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh && chmod +x /usr/local/bin/kp && kp
+# 安装（tr -d '\r' 防 Windows 行尾导致 cannot execute: required file not found）：
+#   wget -qO /tmp/kp.new https://raw.githubusercontent.com/87954621/lxcV6/main/kp.sh && tr -d '\r' < /tmp/kp.new > /usr/local/bin/kp && chmod +x /usr/local/bin/kp && rm -f /tmp/kp.new && kp
 
 set -u
 
@@ -1648,7 +1648,7 @@ cmd_update() {
   if [ -z "$NEW" ]; then
     res "失败" "$RED"
     dim "网络不通，或仓库地址有变"
-    dim "手动更新：wget -qO $SELF $RAW_URL && chmod +x $SELF"
+    dim "手动更新：wget -qO $SELF.tmp $RAW_URL && tr -d '\r' < $SELF.tmp > $SELF && chmod +x $SELF && rm -f $SELF.tmp"
     return 1
   fi
   res "$NEW" "$CYN"
@@ -1691,6 +1691,10 @@ cmd_update() {
   fi
   res "OK" "$GRN"
 
+  # 仓库文件若带 Windows 行尾：#!/bin/sh\r 会让内核找不到解释器，且每行末尾
+  # 的 \r 会污染参数。上面的 cut -c1-9 校验认不出它，写回前统一清掉。
+  tr -d '\r' < "$TMP" > "$TMP.lf" 2>/dev/null && mv "$TMP.lf" "$TMP"
+
   kvn "校验"
   if [ "$(head -1 "$TMP" | cut -c1-9)" != "#!/bin/sh" ] || ! sh -n "$TMP" 2>/dev/null; then
     res "文件不完整或语法错误，已放弃" "$RED"
@@ -1709,7 +1713,7 @@ cmd_update() {
     dim "重新进入菜单生效：kp"
   else
     res "没有写入权限" "$YEL"
-    dim "手动执行：wget -qO $SELF $RAW_URL && chmod +x $SELF"
+    dim "手动执行：wget -qO $SELF.tmp $RAW_URL && tr -d '\r' < $SELF.tmp > $SELF && chmod +x $SELF && rm -f $SELF.tmp"
     rm -f "$TMP"
     return 1
   fi
