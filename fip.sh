@@ -1,5 +1,5 @@
 #!/bin/sh
-# fip-v4.0.sh — 给宿主机造一张假网桥：IPv6 或 IPv4，二选一
+# fip-v4.1.sh — 给宿主机造一张假网桥：IPv6 或 IPv4，二选一
 #
 # 就三件事：
 #   1. ip link add fip0 type bridge && ip link set fip0 up
@@ -8,7 +8,7 @@
 #   3. 完事
 #
 # 不碰 Incus、不碰容器、不建 profile、不写文件。
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v4.0.sh → fip-v4.1.sh）。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v4.1.sh → fip-v4.2.sh）。
 #
 # 用法：
 #   fip                菜单
@@ -21,15 +21,17 @@
 #   fip help / version
 #
 # 环境变量：
-#   FIP_DEV=fip0           网桥名
+#   FIP_DEV=fip0           设备名（默认 fip0）
+#   FIP_TYPE=dummy|bridge  设备类型（默认 dummy，和 v1.0 一样）
 #   FIP_PREFIX=2606:54c1:1:c4   IPv6 默认前缀
 #   FIP_V4=175.45.176.0/22     IPv4 默认段
 #   FIP_COLOR=0            关颜色
 set -u
 
-VERSION="4.0"
+VERSION="4.1"
 
 DEV="${FIP_DEV:-fip0}"
+DEV_TYPE="${FIP_TYPE:-dummy}"
 PREFIX="${FIP_PREFIX:-2606:54c1:1:c4}"
 V4_NET="${FIP_V4:-175.45.176.0/22}"
 
@@ -310,12 +312,13 @@ ensure_dev() {
     ip link set "$DEV" up 2>/dev/null
     return 0
   fi
-  if ip link add "$DEV" type bridge 2>/dev/null; then
+  if ip link add "$DEV" type "$DEV_TYPE" 2>/dev/null; then
     ip link set "$DEV" up 2>/dev/null
-    ok "已建网桥 $DEV"
+    ok "已建 $DEV（$DEV_TYPE）"
     return 0
   fi
-  err "建网桥失败：ip link add $DEV type bridge"
+  err "建失败：ip link add $DEV type $DEV_TYPE"
+  dim "换类型：FIP_TYPE=bridge fip v6   或   FIP_TYPE=dummy fip v6"
   return 1
 }
 
@@ -327,9 +330,9 @@ dev_addrs() {
 cmd_v6() {
   _p="$(norm_prefix "${1:-$PREFIX}")"
   valid_prefix "$_p" || { err "前缀不对：$_p（要 3~4 段，如 2606:54c1:1:c4）"; return 1; }
-  hr "IPv6 网桥"
+  hr "IPv6 设备"
   ensure_dev || return 1
-  kvp "网桥" "$DEV"
+  kvp "设备" "$DEV（$DEV_TYPE）"
   kvp "前缀" "${_p}::/64"
   echo
   if ip -6 -o addr show dev "$DEV" scope global 2>/dev/null | grep -qF "${_p}::1/64"; then
@@ -353,9 +356,9 @@ cmd_v4() {
   _base="${_net%%/*}"; _len="${_net##*/}"
   case "$_len" in ''|*[!0-9]*) _len=24 ;; esac
   _gw="$(int2ip "$(( $(ip2int "$_base") + 1 ))")"
-  hr "IPv4 网桥"
+  hr "IPv4 设备"
   ensure_dev || return 1
-  kvp "网桥" "$DEV"
+  kvp "设备" "$DEV（$DEV_TYPE）"
   kvp "段" "$_net"
   kvp "网关地址" "${_gw}/${_len}"
   echo
@@ -375,7 +378,7 @@ cmd_v4() {
 cmd_status() {
   hrt "状态"
   if dev_exists; then
-    kvp "网桥" "$DEV"
+    kvp "设备" "$DEV（$DEV_TYPE）"
     ip -o link show dev "$DEV" 2>/dev/null | sed 's/^[0-9]*: //' | cut -c1-90 | sed 's/^/  /'
     echo
     hr "地址"
@@ -532,9 +535,9 @@ ui_help() {
   item "fip down"      "删网桥"
   item "fip gen6/gen4" "生成一个 /128 或 /32"
   echo
-  dim "只动宿主机：ip link add $DEV type bridge + ip addr add"
+  dim "只动宿主机：ip link add $DEV type $DEV_TYPE + ip addr add"
   dim "不碰 Incus、不碰容器、不写文件"
-  dim "环境变量：FIP_DEV=$DEV  FIP_PREFIX=$PREFIX  FIP_V4=$V4_NET"
+  dim "环境变量：FIP_DEV=$DEV  FIP_TYPE=$DEV_TYPE  FIP_PREFIX=$PREFIX  FIP_V4=$V4_NET"
 }
 
 cmd_menu() {
@@ -586,7 +589,7 @@ usage() {
   fip help / version
 
 它就是：
-  ip link add fip0 type bridge
+  ip link add fip0 type dummy     # 或 bridge（FIP_TYPE 控制）
   ip link set fip0 up
   ip addr add 2606:54c1:1:c4::1/64 dev fip0     # 或者
   ip addr add 175.45.176.1/22 dev fip0
@@ -594,14 +597,15 @@ usage() {
 不碰 Incus、不碰容器、不写文件。
 
 环境变量：
-  FIP_DEV=fip0                网桥名
+  FIP_DEV=fip0                设备名
+  FIP_TYPE=dummy|bridge       设备类型（默认 dummy）
   FIP_PREFIX=2606:54c1:1:c4   IPv6 默认前缀
   FIP_V4=175.45.176.0/22      IPv4 默认段
   FIP_COLOR=0                 关颜色
   FIP_MENU=0                  无参数不进菜单
 
 安装：
-  install -m 755 fip-v4.0.sh /usr/local/bin/fip
+  install -m 755 fip-v4.1.sh /usr/local/bin/fip
 EOF
 }
 
