@@ -1,10 +1,10 @@
 #!/bin/sh
-# fip-v0.4.sh — 只做一件事：建一张网卡，把 IP / IP 段绑上去
+# fip-v0.6.sh — 只做一件事：建一张网卡，把 IP / IP 段绑上去
 #
 # 不认探针、不改探针配置、不开机自启、不记账本、不写任何文件。
 # 绑地址用 noprefixroute：只让地址出现在网卡上，不往路由表里加东西。
 #
-# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.4.sh → fip-v0.5.sh）。
+# 版本规则：每次改动 +0.1，新建一个文件，旧版本保留不删（fip-v0.6.sh → fip-v0.7.sh）。
 #
 # 用法：
 #   fip                     终端里进菜单；非 TTY 时只列候选
@@ -35,14 +35,14 @@
 #   FIP_COLOR=0                 关掉颜色（也认 NO_COLOR）
 set -u
 
-VERSION="0.4"
+VERSION="0.6"
 
 DEV="${FIP_DEV:-fip0}"
 NOPREFIX="${FIP_NOPREFIXROUTE:-1}"
 
 # 内置朝鲜地址组：
 #   104.29.195.20~.23    Cloudflare geofeed 标 KP 的 4 个 /32
-#   2606:54c1:1:c4::/64  Cloudflare geofeed 整段标 KP
+#   2606:54c1:1:c4::/64  Cloudflare geofeed 整段标 KP（生成 /128 也用它）
 #   175.45.176.0/22      KP 的整段（175.45.176.0~175.45.179.255）
 DEFAULT_ADDRS="${FIP_DEFAULT_ADDRS:-104.29.195.20/32 104.29.195.21/32 104.29.195.22/32 104.29.195.23/32 2606:54c1:1:c4::/64 175.45.176.0/22}"
 
@@ -159,9 +159,10 @@ readline() {   # $1=提示 $2=默认值 → UI_IN
 }
 
 ui_clear() {
-  if [ -t 1 ]; then
-    clear 2>/dev/null || printf '%s[H%s[2J' "$ESC" "$ESC"
-  fi
+  # 不依赖 clear：有些精简系统里 clear 存在但不生效（返回 0 却不发清屏序列），
+  # 那样旧画面会留在屏幕上，看起来像「删了网卡还显示 IP」。
+  [ -t 1 ] || return 0
+  printf '%s[H%s[2J%s[3J' "$ESC" "$ESC" "$ESC"
   return 0
 }
 
@@ -477,12 +478,22 @@ cmd_down() {
   _v6=$(ip -o -6 addr show dev "$DEV" scope global 2>/dev/null | wc -l | tr -d ' ')
   kvn "将删除"; res "$_v4 个 IPv4 / $_v6 个 IPv6 地址" "$BYEL"
   echo
-  if ip link del "$DEV" 2>/dev/null; then
-    ok "已删除 $DEV"
-  else
-    err "删除失败（需要 root）"
+
+  # 删掉并复核：有的环境会被别的服务/脚本立刻建回来，
+  # 只看 ip link del 的返回值会误报成功。
+  ip link del "$DEV" 2>/dev/null
+  _i=0
+  while [ "$_i" -lt 5 ] && ip link show "$DEV" >/dev/null 2>&1; do
+    ip link set "$DEV" down 2>/dev/null
+    ip link del "$DEV" 2>/dev/null
+    _i=$(( _i + 1 ))
+  done
+  if ip link show "$DEV" >/dev/null 2>&1; then
+    err "删除失败：$DEV 还在"
+    dim "可能被别的服务 / 脚本立刻建了回来；手动确认：ip link show $DEV"
     return 1
   fi
+  ok "已删除 $DEV（已复核：不存在）"
   return 0
 }
 
@@ -774,13 +785,13 @@ usage() {
 地址写法：
   104.29.195.20             单个 IPv4        → 加 /32
   175.45.176.0/22           带掩码的段
-  2606:54c1:1:c4::/64       IPv6 段
+  2606:54c1:1:c4::/64       IPv6 段（/48 也行：2606:54c1:1::/48）
   104.29.195.20-104.29.195.23   范围，自动换算成 CIDR
   "1.2.3.4 5.6.7.8"         多个：空格或逗号分隔
 
 内置朝鲜 IP（菜单 1 的 6 条）：
   104.29.195.20/32  104.29.195.21/32  104.29.195.22/32  104.29.195.23/32
-  2606:54c1:1:c4::/64
+  2606:54c1:1:c4::/64      整段标 KP，生成 /128 也用这段
   175.45.176.0/22
 
 环境变量：
