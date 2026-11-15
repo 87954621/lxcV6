@@ -1,5 +1,5 @@
 #!/bin/sh
-# fip-v4.3.sh — 宿主机假网卡 + 按国家加地址（Cloudflare CSV）
+# fip-v4.7.sh — 宿主机假网卡 + 按国家加地址（Cloudflare CSV）
 #
 # 一个「加地址」入口，三种来源：
 #   1. 内置（朝鲜：2606:54c1:1:c4::/64、175.45.176.0/22、4 个 /32）
@@ -12,7 +12,7 @@
 # noprefixroute 的作用：地址照样显示，但不生成「这个网段在这张卡上」的直连路由，
 # 避免把去往真实 IP（比如 Cloudflare 的段）的流量带进黑洞。
 #
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v4.3.sh → fip-v4.4.sh）。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v4.7.sh → fip-v4.8.sh）。
 #
 # 用法：
 #   fip                    菜单
@@ -34,11 +34,17 @@
 #   FIP_V4=175.45.176.0/22       IPv4 默认段
 #   FIP_CSV_URL=...              Cloudflare CSV 地址
 #   FIP_CSV_CACHE=/var/tmp/fip-country.csv
+  FIP_LOG=/var/log/fip.log     操作日志路径
+  LOG_MAX_KB=512               超过就轮转
+  LOG_KEEP=3                   保留旧日志个数
 #   FIP_CONF=/etc/fip.conf       保存“自动更新”设置
+#   FIP_LOG=/var/log/fip.log     操作日志
+#   LOG_MAX_KB=512               日志超过 512KB 自动轮转
+#   LOG_KEEP=3                   最多保留 3 个旧日志
 #   FIP_COLOR=0                  关颜色
 set -u
 
-VERSION="4.3"
+VERSION="4.7"
 
 DEV="${FIP_DEV:-fip0}"
 DEV_TYPE="${FIP_TYPE:-dummy}"
@@ -48,10 +54,269 @@ CSV_URL="${FIP_CSV_URL:-https://api.cloudflare.com/local-ip-ranges.csv}"
 CSV_CACHE="${FIP_CSV_CACHE:-/var/tmp/fip-country.csv}"
 CONF="${FIP_CONF:-/etc/fip.conf}"
 CSV_TTL="${CSV_TTL:-0}"
+STATE="${FIP_STATE:-/etc/fip/state}"
+LOG="${FIP_LOG:-/var/log/fip.log}"
+LOG_MAX_KB="${LOG_MAX_KB:-512}"
+LOG_KEEP="${LOG_KEEP:-3}"
 
 [ -r "$CONF" ] && . "$CONF" 2>/dev/null
 case "${CSV_TTL:-0}" in ''|*[!0-9]*) CSV_TTL=0 ;; esac
 
+
+# 国家代码 -> 中文名（ISO 3166-1，来自 CSV 里出现的代码）
+CC_NAMES="
+AD 安道尔
+AE 阿拉伯联合酋长国
+AF 阿富汗
+AG 安提瓜和巴布达
+AI 安圭拉
+AL 阿尔巴尼亚
+AM 亚美尼亚
+AO 安哥拉
+AQ 南极洲
+AR 阿根廷
+AS 美属萨摩亚
+AT 奥地利
+AU 澳大利亚
+AW 阿鲁巴
+AX 奥兰群岛
+AZ 阿塞拜疆
+BA 波斯尼亚和黑塞哥维那
+BB 巴巴多斯
+BD 孟加拉国
+BE 比利时
+BF 布基纳法索
+BG 保加利亚
+BH 巴林
+BI 布隆迪
+BJ 贝宁
+BL 圣巴泰勒米
+BM 百慕大
+BN 文莱
+BO 玻利维亚
+BQ 荷属加勒比区
+BR 巴西
+BS 巴哈马
+BT 不丹
+BV 布韦岛
+BW 博茨瓦纳
+BY 白俄罗斯
+BZ 伯利兹
+CA 加拿大
+CC 科科斯（基林）群岛
+CD 刚果（金）
+CF 中非共和国
+CG 刚果（布）
+CH 瑞士
+CI 科特迪瓦
+CK 库克群岛
+CL 智利
+CM 喀麦隆
+CN 中国
+CO 哥伦比亚
+CR 哥斯达黎加
+CU 古巴
+CV 佛得角
+CW 库拉索
+CX 圣诞岛
+CY 塞浦路斯
+CZ 捷克
+DE 德国
+DJ 吉布提
+DK 丹麦
+DM 多米尼克
+DO 多米尼加共和国
+DZ 阿尔及利亚
+EC 厄瓜多尔
+EE 爱沙尼亚
+EG 埃及
+EH 西撒哈拉
+ER 厄立特里亚
+ES 西班牙
+ET 埃塞俄比亚
+FI 芬兰
+FJ 斐济
+FK 福克兰群岛
+FM 密克罗尼西亚
+FO 法罗群岛
+FR 法国
+GA 加蓬
+GB 英国
+GD 格林纳达
+GE 格鲁吉亚
+GF 法属圭亚那
+GG 根西岛
+GH 加纳
+GI 直布罗陀
+GL 格陵兰
+GM 冈比亚
+GN 几内亚
+GP 瓜德罗普
+GQ 赤道几内亚
+GR 希腊
+GS 南乔治亚和南桑威奇群岛
+GT 危地马拉
+GU 关岛
+GW 几内亚比绍
+GY 圭亚那
+HK 中国香港特别行政区
+HM 赫德岛和麦克唐纳群岛
+HN 洪都拉斯
+HR 克罗地亚
+HT 海地
+HU 匈牙利
+ID 印度尼西亚
+IE 爱尔兰
+IL 以色列
+IM 马恩岛
+IN 印度
+IO 英属印度洋领地
+IQ 伊拉克
+IR 伊朗
+IS 冰岛
+IT 意大利
+JE 泽西岛
+JM 牙买加
+JO 约旦
+JP 日本
+KE 肯尼亚
+KG 吉尔吉斯斯坦
+KH 柬埔寨
+KI 基里巴斯
+KM 科摩罗
+KN 圣基茨和尼维斯
+KP 朝鲜
+KR 韩国
+KW 科威特
+KY 开曼群岛
+KZ 哈萨克斯坦
+LA 老挝
+LB 黎巴嫩
+LC 圣卢西亚
+LI 列支敦士登
+LK 斯里兰卡
+LR 利比里亚
+LS 莱索托
+LT 立陶宛
+LU 卢森堡
+LV 拉脱维亚
+LY 利比亚
+MA 摩洛哥
+MC 摩纳哥
+MD 摩尔多瓦
+ME 黑山
+MF 法属圣马丁
+MG 马达加斯加
+MH 马绍尔群岛
+MK 北马其顿
+ML 马里
+MM 缅甸
+MN 蒙古
+MO 中国澳门特别行政区
+MP 北马里亚纳群岛
+MQ 马提尼克
+MR 毛里塔尼亚
+MS 蒙特塞拉特
+MT 马耳他
+MU 毛里求斯
+MV 马尔代夫
+MW 马拉维
+MX 墨西哥
+MY 马来西亚
+MZ 莫桑比克
+NA 纳米比亚
+NC 新喀里多尼亚
+NE 尼日尔
+NF 诺福克岛
+NG 尼日利亚
+NI 尼加拉瓜
+NL 荷兰
+NO 挪威
+NP 尼泊尔
+NR 瑙鲁
+NU 纽埃
+NZ 新西兰
+OM 阿曼
+PA 巴拿马
+PE 秘鲁
+PF 法属波利尼西亚
+PG 巴布亚新几内亚
+PH 菲律宾
+PK 巴基斯坦
+PL 波兰
+PM 圣皮埃尔和密克隆群岛
+PN 皮特凯恩群岛
+PR 波多黎各
+PS 巴勒斯坦领土
+PT 葡萄牙
+PW 帕劳
+PY 巴拉圭
+Pa Pa
+QA 卡塔尔
+RE 留尼汪
+RO 罗马尼亚
+RS 塞尔维亚
+RU 俄罗斯
+RW 卢旺达
+SA 沙特阿拉伯
+SB 所罗门群岛
+SC 塞舌尔
+SD 苏丹
+SE 瑞典
+SG 新加坡
+SH 圣赫勒拿
+SI 斯洛文尼亚
+SJ 斯瓦尔巴和扬马延
+SK 斯洛伐克
+SL 塞拉利昂
+SM 圣马力诺
+SN 塞内加尔
+SO 索马里
+SR 苏里南
+SS 南苏丹
+ST 圣多美和普林西比
+SV 萨尔瓦多
+SX 荷属圣马丁
+SY 叙利亚
+SZ 斯威士兰
+TC 特克斯和凯科斯群岛
+TD 乍得
+TF 法属南部领地
+TG 多哥
+TH 泰国
+TJ 塔吉克斯坦
+TK 托克劳
+TL 东帝汶
+TM 土库曼斯坦
+TN 突尼斯
+TO 汤加
+TR 土耳其
+TT 特立尼达和多巴哥
+TV 图瓦卢
+TW 台湾
+TZ 坦桑尼亚
+UA 乌克兰
+UG 乌干达
+UM 美国本土外小岛屿
+US 美国
+UY 乌拉圭
+UZ 乌兹别克斯坦
+VA 梵蒂冈
+VC 圣文森特和格林纳丁斯
+VE 委内瑞拉
+VG 英属维尔京群岛
+VI 美属维尔京群岛
+VN 越南
+VU 瓦努阿图
+WF 瓦利斯和富图纳
+WS 萨摩亚
+XK 科索沃
+YE 也门
+YT 马约特
+ZA 南非
+ZM 赞比亚
+ZW 津巴布韦
+"
 BUILTIN_V6="2606:54c1:1:c4::/64"
 BUILTIN_V4="175.45.176.0/22"
 BUILTIN_32="104.29.195.20/32 104.29.195.21/32 104.29.195.22/32 104.29.195.23/32"
@@ -320,9 +585,9 @@ random_v4_in() {
 random_v6_in() {
   _c="$1"; _p="${_c%%/*}"; _l="${_c##*/}"
   case "$_l" in ''|*[!0-9]*) _l=64 ;; esac
-  if [ "$_l" -gt 64 ]; then printf '%s/128\n' "$_p"; return 0; fi
   while [ "${_p%:}" != "$_p" ]; do _p="${_p%:}"; done
-  _g1=0; _g2=0; _g3=0; _g4=0; _n=0; _s="$_p"
+  _g1=0; _g2=0; _g3=0; _g4=0; _g5=0; _g6=0; _g7=0; _g8=0
+  _n=0; _s="$_p"
   while [ -n "$_s" ]; do
     case "$_s" in
       *:*) _x="${_s%%:*}"; _s="${_s#*:}" ;;
@@ -334,10 +599,19 @@ random_v6_in() {
       2) [ -n "$_x" ] && _g2="$_x" ;;
       3) [ -n "$_x" ] && _g3="$_x" ;;
       4) [ -n "$_x" ] && _g4="$_x" ;;
+      5) [ -n "$_x" ] && _g5="$_x" ;;
+      6) [ -n "$_x" ] && _g6="$_x" ;;
+      7) [ -n "$_x" ] && _g7="$_x" ;;
+      8) [ -n "$_x" ] && _g8="$_x" ;;
     esac
   done
-  printf '%s:%s:%s:%s:%x:%x:%x:%x/128\n' \
-    "$_g1" "$_g2" "$_g3" "$_g4" "$(rand16)" "$(rand16)" "$(rand16)" "$(rand16)"
+  if [ "$_l" -le 64 ]; then
+    printf '%s:%s:%s:%s:%x:%x:%x:%x/128\n' \
+      "$_g1" "$_g2" "$_g3" "$_g4" "$(rand16)" "$(rand16)" "$(rand16)" "$(rand16)"
+  else
+    printf '%s:%s:%s:%s:%s:%s:%s:%s/128\n' \
+      "$_g1" "$_g2" "$_g3" "$_g4" "$_g5" "$_g6" "$_g7" "$_g8"
+  fi
 }
 
 gen_v6_128() {
@@ -351,8 +625,12 @@ gen_v6_128() {
 }
 
 gen_v4_32() {
-  _r="$(rand16 v4)"; _n=$(( _r % 1024 ))
-  _b="$(ip2int "175.45.176.0")"
+  _base="${V4_NET%%/*}"; _len="${V4_NET##*/}"
+  case "$_len" in ''|*[!0-9]*) _len=22 ;; esac
+  _size=$(( 1 << (32 - _len) ))
+  [ "$_size" -gt 65536 ] && _size=65536
+  _r="$(rand16 v4)"; _n=$(( _r % _size ))
+  _b="$(ip2int "$_base")"
   printf '%s/32\n' "$(int2ip "$(( _b + _n ))")"
 }
 
@@ -382,13 +660,16 @@ add_addr() {
   _d="${1:-$DEV}"; _a="$2"
   if has_addr "$_d" "$_a"; then
     dim "已存在：$_a"
-    return 0
+    log_write skip "$_d $_a"
+    return 2
   fi
   if ip addr add "$_a" dev "$_d" noprefixroute 2>/dev/null; then
     ok "$_d  $_a"
+    log_write add "$_d $_a"
     return 0
   fi
   dim "失败：$_a"
+  log_write fail "$_d $_a"
   return 1
 }
 
@@ -420,19 +701,73 @@ cmd_v4() {
   return 0
 }
 
+# 所有 fip* 设备（含 DEV）
+fip_devs() {
+  { printf '%s\n' "$DEV"
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}'
+  } | awk -v d="$DEV" '$0==d || $0 ~ /^fip/' | sort -u | while IFS= read -r _d; do
+    dev_exists "$_d" && printf '%s\n' "$_d"
+  done
+}
+
+# 每行：设备|family|地址/掩码
+addr_rows() {
+  for _d in $(fip_devs); do
+    ip -o addr show dev "$_d" scope global 2>/dev/null | awk -v d="$_d" '{print d "|" $3 "|" $4}'
+  done
+}
+
 cmd_status() {
   hr "状态"
-  _d="${1:-$DEV}"
-  if dev_exists "$_d"; then
+  _rows="$(addr_rows)"
+  _found=0
+  for _d in $(fip_devs); do
+    _found=1
     kvp "设备" "$_d"
-    _a="$(ip -o addr show dev "$_d" scope global 2>/dev/null | awk '{print $3 " " $4}')"
-    if [ -n "$_a" ]; then
-      printf '%s\n' "$_a" | sed 's/^/   /'
-    else
-      dim "没有地址"
-    fi
+    _a="$(printf '%s\n' "$_rows" | awk -F'|' -v d="$_d" '$1==d{print "   " $2 " " $3}')"
+    if [ -n "$_a" ]; then printf '%s\n' "$_a"; else dim "   没有地址"; fi
+  done
+  [ "$_found" -eq 0 ] && dim "没有 fip* 设备（fip v6 / fip v4）"
+  return 0
+}
+
+# 删除一个地址（带序号选择）
+cmd_del_addr() {
+  _rows="$(addr_rows)"
+  if [ -z "$_rows" ]; then dim "没有可删的地址"; return 0; fi
+  hr "选择要删除的地址"
+  printf '%s\n' "$_rows" | awk -F'|' '{printf "   %2d  %-6s %s\n", NR, $1, $3}'
+  echo
+  readline "序号（回车取消）：" ""
+  case "$UI_IN" in ''|*[!0-9]*) dim "已取消"; return 0 ;; esac
+  _line="$(printf '%s\n' "$_rows" | awk -F'|' -v n="$UI_IN" 'NR==n{print $1 "|" $3}')"
+  [ -n "$_line" ] || { err "序号不对"; return 0; }
+  _dd="${_line%%|*}"; _aa="${_line#*|}"
+  if ip addr del "$_aa" dev "$_dd" 2>/dev/null; then
+    ok "已删除 $_dd  $_aa"
+    log_write del "$_dd $_aa"
   else
-    dim "设备 $_d 不存在（fip v6 / fip v4）"
+    err "删除失败：$_dd $_aa"
+  fi
+  return 0
+}
+
+# 删除整个设备（带序号选择）
+cmd_del_dev() {
+  _devs="$(fip_devs)"
+  if [ -z "$_devs" ]; then dim "没有 fip* 设备"; return 0; fi
+  hr "选择要删除的设备"
+  printf '%s\n' "$_devs" | awk '{printf "   %2d  %s\n", NR, $0}'
+  echo
+  readline "序号（回车取消）：" ""
+  case "$UI_IN" in ''|*[!0-9]*) dim "已取消"; return 0 ;; esac
+  _dd="$(printf '%s\n' "$_devs" | awk -v n="$UI_IN" 'NR==n{print}')"
+  [ -n "$_dd" ] || { err "序号不对"; return 0; }
+  if ip link del "$_dd" 2>/dev/null; then
+    ok "已删除设备 $_dd"
+    log_write deldev "$_dd"
+  else
+    err "删除失败：$_dd"
   fi
   return 0
 }
@@ -501,6 +836,11 @@ _download_csv() {
     wget -qO "$_tmp" "$CSV_URL" 2>/dev/null || { rm -f "$_tmp"; return 1; }
   fi
   [ -s "$_tmp" ] || { rm -f "$_tmp"; return 1; }
+  _first="$(head -1 "$_tmp" 2>/dev/null | tr -d '\r')"
+  case "$_first" in
+    */*,*) ;;
+    *) rm -f "$_tmp"; err "下载内容不像 CSV：$_first"; return 1 ;;
+  esac
   mv "$_tmp" "$CSV_CACHE"
   return 0
 }
@@ -511,6 +851,9 @@ fetch_csv() {
     [ "$CSV_TTL" -le 0 ] && return 0
     _age="$(csv_age)"
     [ -n "$_age" ] && [ "$_age" -lt "$CSV_TTL" ] && return 0
+    if _download_csv; then return 0; fi
+    warn "更新失败，继续使用旧缓存"
+    return 0
   fi
   _download_csv
 }
@@ -531,9 +874,9 @@ cmd_csv_status() {
 
 cmd_csv_refresh() {
   hr "更新 CSV"
-  rm -f "$CSV_CACHE" 2>/dev/null
   if _download_csv; then
     ok "已更新：$CSV_CACHE（$(wc -l < "$CSV_CACHE" | tr -d ' ') 行）"
+    log_write csv "refresh ok"
   else
     err "下载失败：$CSV_URL"
     return 1
@@ -647,22 +990,28 @@ cmd_country_list() {
   kvp "国家数" "$_total"
   kvp "缓存" "$CSV_CACHE"
   echo
-  printf '%s\n' "$_list" | awk '{printf "   %-4s %s\n", $1, $2}'
+  printf '%s\n' "$_list" | awk -v names="$CC_NAMES" '
+    BEGIN { n=split(names,a,"\n"); for(i=1;i<=n;i++){ split(a[i],p," "); m[p[1]]=substr(a[i], length(p[1])+2) } }
+    { printf "   %-4s %-18s %s\n", $1, (($1 in m)?m[$1]:""), $2 }'
   return 0
 }
 
 # 选设备：fip0 或 fip1
 choose_dev() {
+  case "$DEV" in
+    *0) _new="${DEV%0}1" ;;
+    *)  _new="${DEV}1" ;;
+  esac
   printf '   %s1%s  %s（现有设备）\n' "$BOLD_W" "$RST" "$DEV"
-  printf '   %s2%s  新建 %s1（%s）\n' "$BOLD_W" "$RST" "$DEV" "$DEV_TYPE"
+  if dev_exists "$_new"; then
+    printf '   %s2%s  %s（已存在，复用）\n' "$BOLD_W" "$RST" "$_new"
+  else
+    printf '   %s2%s  新建 %s（%s）\n' "$BOLD_W" "$RST" "$_new" "$DEV_TYPE"
+  fi
   echo
   readline "加到哪 [1/2，回车=1]：" "1"
   case "$UI_IN" in
-    2)
-      case "$DEV" in
-        *0) TG_DEV="${DEV%0}1" ;;
-        *)  TG_DEV="${DEV}1" ;;
-      esac ;;
+    2) TG_DEV="$_new" ;;
     *) TG_DEV="$DEV" ;;
   esac
   ensure_dev "$TG_DEV" || return 1
@@ -672,19 +1021,26 @@ choose_dev() {
 # 加“段或单 IP”：$1=段列表（空格） $2=seg|one
 apply_list() {
   _list="$1"; _form="${2:-seg}"
-  _n=0
+  _new=0; _skip=0; _fail=0
   for _c in $_list; do
     if [ "$_form" = "one" ]; then
       case "$_c" in
-        *:*) _one="$(random_v6_in "$_c")" ;;
-        *)   _one="$(random_v4_in "$_c")" ;;
+        *:*) _a="$(random_v6_in "$_c")" ;;
+        *)   _a="$(random_v4_in "$_c")" ;;
       esac
-      add_addr "$TG_DEV" "$_one" && _n=$(( _n + 1 ))
     else
-      add_addr "$TG_DEV" "$_c" && _n=$(( _n + 1 ))
+      _a="$_c"
     fi
+    add_addr "$TG_DEV" "$_a"; _r=$?
+    case "$_r" in
+      0) _new=$(( _new + 1 )) ;;
+      2) _skip=$(( _skip + 1 )) ;;
+      *) _fail=$(( _fail + 1 )) ;;
+    esac
   done
-  [ "$_n" -gt 0 ] && ok "共加 $_n 条" || dim "没有新增"
+  [ "$_new" -gt 0 ] && ok "新增 $_new 条"
+  [ "$_skip" -gt 0 ] && dim "已存在 $_skip 条"
+  [ "$_fail" -gt 0 ] && warn "失败 $_fail 条"
   return 0
 }
 
@@ -723,13 +1079,38 @@ ui_country() {
   hr "按国家（Cloudflare）"
   fetch_csv || { err "下载失败：$CSV_URL"; dim "手动：curl -fsSL $CSV_URL -o $CSV_CACHE"; return 1; }
   csv_ok || { err "CSV 里没找到 country / ip 列"; return 1; }
-  _top="$(csv_countries | head -20)"
-  printf '   %s代码  段数%s\n' "$GRA" "$RST"
-  printf '%s\n' "$_top" | awk '{printf "   %-4s %s\n", $1, $2}'
-  echo
-  readline "国家代码（如 US/SG/JP），回车取消：" ""
-  [ -n "$UI_IN" ] || { dim "已取消"; return 0; }
-  _cc="$(printf '%s' "$UI_IN" | tr 'a-z' 'A-Z')"
+  _rows="$(csv_countries)"
+  _total=$(printf '%s\n' "$_rows" | grep -c .)
+  if [ "$_total" -eq 0 ]; then
+    err "CSV 里没有国家数据（缓存可能损坏，试 fip data refresh）"
+    return 1
+  fi
+  _per=20
+  _pages=$(( (_total + _per - 1) / _per ))
+  [ "$_pages" -lt 1 ] && _pages=1
+  _pg=1
+  _cc=""
+  while [ -z "$_cc" ]; do
+    _s=$(( (_pg - 1) * _per + 1 ))
+    _e=$(( _pg * _per ))
+    printf '   %s第 %d/%d 页 · 共 %d 个国家%s\n\n' "$GRA" "$_pg" "$_pages" "$_total" "$RST"
+    printf '   %s 序号 代码 名称             段数%s\n' "$GRA" "$RST"
+    printf '%s\n' "$_rows" | awk -v s="$_s" -v e="$_e" -v names="$CC_NAMES" '
+      BEGIN { n=split(names,a,"\n"); for(i=1;i<=n;i++){ split(a[i],p," "); m[p[1]]=substr(a[i], length(p[1])+2) } }
+      NR>=s && NR<=e { printf "   %3d  %-4s %-16s %s\n", NR, $1, (($1 in m)?m[$1]:""), $2 }
+    '
+    echo
+    readline "序号 / n下一页 / p上一页 / 代码 / 回车取消：" ""
+    case "$UI_IN" in
+      ''|q|Q) return 0 ;;
+      n|N) [ "$_pg" -lt "$_pages" ] && _pg=$(( _pg + 1 )) ;;
+      p|P) [ "$_pg" -gt 1 ] && _pg=$(( _pg - 1 )) ;;
+      *[!0-9]*) _cc="$(printf '%s' "$UI_IN" | tr 'a-z' 'A-Z')" ;;
+      *)
+        _pick="$(printf '%s\n' "$_rows" | awk -v n="$UI_IN" 'NR==n{print $1}')"
+        if [ -n "$_pick" ]; then _cc="$_pick"; else err "序号不对"; fi ;;
+    esac
+  done
   readline "协议 [1=IPv4 2=IPv6 3=都，回车=3]：" "3"
   case "$UI_IN" in
     1) _fam=v4 ;;
@@ -801,12 +1182,198 @@ ui_help() {
   item "fip country list" "列出国家"
   item "fip data refresh" "立即更新 CSV"
   item "fip data auto daily" "自动更新（off/daily/weekly/monthly）"
-  item "fip status"    "看设备和地址"
-  item "fip down"      "删除设备"
+  item "fip status"    "看所有设备和地址"
+  item "fip del-addr"  "按序号删地址"
+  item "fip del-dev"   "按序号删设备"
+  item "fip save"      "保存当前状态（可选开机恢复）"
+  item "fip restore"   "立即恢复"
+  item "fip log"       "操作日志（status/tail/clear）"
   echo
   dim "所有地址：ip addr add <地址> dev <设备> noprefixroute"
   dim "noprefixroute = 不生成网段路由，不影响真实流量"
   dim "环境变量：FIP_DEV=$DEV  FIP_TYPE=$DEV_TYPE"
+}
+
+# ── 操作日志 ─────────────────────────────────────────────
+log_size() {
+  [ -f "$LOG" ] || { printf '0'; return 0; }
+  wc -c < "$LOG" 2>/dev/null | tr -d ' '
+}
+
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  _max=$(( ${LOG_MAX_KB:-512} * 1024 ))
+  [ "$(log_size)" -lt "$_max" ] && return 0
+  _i="${LOG_KEEP:-3}"
+  while [ "$_i" -gt 1 ]; do
+    [ -f "$LOG.$((_i-1))" ] && mv -f "$LOG.$((_i-1))" "$LOG.$_i" 2>/dev/null
+    _i=$(( _i - 1 ))
+  done
+  mv -f "$LOG" "$LOG.1" 2>/dev/null
+  return 0
+}
+
+log_write() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
+  rotate_log
+  printf '%s  %-7s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "${1:-info}" "${2:-}" >> "$LOG" 2>/dev/null
+  return 0
+}
+
+cmd_log() {
+  _act="${1:-status}"
+  case "$_act" in
+    status|'')
+      hr "操作日志"
+      kvp "文件" "$LOG"
+      if [ -f "$LOG" ]; then
+        kvp "大小" "$(log_size) 字节"
+        kvp "行数" "$(wc -l < "$LOG" | tr -d ' ')"
+        kvp "轮转" "超过 ${LOG_MAX_KB}KB，保留 ${LOG_KEEP} 个"
+        echo
+        tail -10 "$LOG" 2>/dev/null | sed 's/^/   /'
+      else
+        dim "还没有日志"
+      fi ;;
+    tail|show)
+      [ -f "$LOG" ] || { dim "还没有日志"; return 0; }
+      tail -n "${2:-30}" "$LOG" 2>/dev/null | sed 's/^/   /' ;;
+    clear|clean)
+      rm -f "$LOG" "$LOG".* 2>/dev/null
+      ok "日志已清空" ;;
+    *) err "用法：fip log [status|tail [n]|clear]" ;;
+  esac
+  return 0
+}
+
+ui_log() {
+  hr "操作日志"
+  cmd_log status
+  echo
+  item "1" "查看最近 30 条"
+  item "2" "清空日志"
+  item "0" "返回"
+  echo
+  readline "选择 [0-2]：" ""
+  case "$UI_IN" in
+    1) echo; cmd_log tail 30 ;;
+    2) if ask "清空 $LOG 和旧日志？"; then echo; cmd_log clear; fi ;;
+    *) dim "已取消" ;;
+  esac
+}
+
+# ── 保存 / 恢复 ──────────────────────────────────────────
+dev_type_of() {
+  if ip -d link show dev "$1" 2>/dev/null | grep -qw dummy; then
+    printf 'dummy'
+  else
+    printf 'bridge'
+  fi
+}
+
+save_state() {
+  _devs="$(fip_devs)"
+  [ -n "$_devs" ] || { err "没有 fip* 设备可保存"; return 1; }
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+  {
+    printf '# fip state v1\n'
+    for _d in $_devs; do
+      printf 'dev %s %s\n' "$_d" "$(dev_type_of "$_d")"
+      ip -o addr show dev "$_d" scope global 2>/dev/null | awk -v d="$_d" '{print "addr", d, $4}'
+    done
+  } > "$STATE" 2>/dev/null || { err "写 $STATE 失败"; return 1; }
+  ok "已保存：$STATE"
+  log_write save "$STATE"
+  dim "设备 $(printf '%s\n' "$_devs" | grep -c .) 个，地址 $(grep -c '^addr ' "$STATE" 2>/dev/null) 条"
+  return 0
+}
+
+restore_state() {
+  [ -s "$STATE" ] || { dim "没有保存（先 fip save）"; return 1; }
+  hr "恢复"
+  while IFS=' ' read -r _k _a _b; do
+    case "$_k" in
+      dev)
+        if ! ip link show "$_a" >/dev/null 2>&1; then
+          ip link add "$_a" type "$_b" 2>/dev/null && ok "建 $_a（$_b）"
+        fi
+        ip link set "$_a" up 2>/dev/null ;;
+      addr)
+        ip addr add "$_b" dev "$_a" noprefixroute 2>/dev/null && ok "$_a  $_b" ;;
+    esac
+  done < "$STATE"
+  log_write restore "$STATE"
+  return 0
+}
+
+unsave_state() {
+  rm -f "$STATE" 2>/dev/null
+  ok "已删除 $STATE"
+  return 0
+}
+
+install_boot() {
+  if command -v systemctl >/dev/null 2>&1; then
+    cat > /etc/systemd/system/fip-restore.service <<'EOF'
+[Unit]
+Description=fip restore fake addresses
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fip restore
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable fip-restore.service >/dev/null 2>&1 && ok "已启用 fip-restore.service"
+  elif [ -d /etc/local.d ]; then
+    printf '#!/bin/sh\n/usr/local/bin/fip restore\n' > /etc/local.d/fip-restore.start
+    chmod +x /etc/local.d/fip-restore.start
+    rc-update add local default >/dev/null 2>&1 && ok "已写入 /etc/local.d/fip-restore.start"
+  else
+    err "不认识的 init（没有 systemctl / /etc/local.d）"
+    return 1
+  fi
+  return 0
+}
+
+uninstall_boot() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable fip-restore.service >/dev/null 2>&1
+    rm -f /etc/systemd/system/fip-restore.service
+    systemctl daemon-reload 2>/dev/null
+    ok "已移除 fip-restore.service"
+  fi
+  rm -f /etc/local.d/fip-restore.start 2>/dev/null
+  return 0
+}
+
+ui_save() {
+  hr "保存 / 开机恢复"
+  if [ -s "$STATE" ]; then
+    kvp "已保存" "$STATE（$(grep -c '^addr ' "$STATE" 2>/dev/null) 条地址）"
+  else
+    kvp "已保存" "还没有"
+  fi
+  echo
+  item "1" "保存当前状态"
+  item "2" "立即恢复"
+  item "3" "删除保存"
+  item "4" "安装开机自动恢复"
+  item "5" "卸载开机自动恢复"
+  item "0" "返回"
+  echo
+  readline "选择 [0-5]：" ""
+  case "$UI_IN" in
+    1) echo; save_state; if ask "同时设置开机自动恢复？"; then install_boot; fi ;;
+    2) echo; restore_state ;;
+    3) echo; unsave_state ;;
+    4) echo; install_boot ;;
+    5) echo; uninstall_boot ;;
+    *) dim "已取消" ;;
+  esac
 }
 
 cmd_menu() {
@@ -820,17 +1387,18 @@ cmd_menu() {
     printf '   %s◆%s %sfip%s %s%s%s   %s·%s   %s宿主机网桥 · 加地址%s\n' \
       "$ORNG_B" "$RST" "$GRA" "$RST" "$BOLD_W" "$VERSION" "$RST" "$GRA" "$RST" "$TEAL_B" "$RST"
     echo
-    printf '   %s┃%s ' "$BORD" "$RST"
-    if dev_exists "$DEV"; then
-      printf '%s◈%s 设备 %s%s%s %s\n' "$SKY_B" "$RST" "$BOLD_W" "$DEV" "$RST" "$(st_badge "$BGRN" "已建")"
+    _devs="$(fip_devs)"
+    if [ -n "$_devs" ]; then
+      for _d in $_devs; do
+        _n="$(ip -o addr show dev "$_d" scope global 2>/dev/null | grep -c .)"
+        _v6="$(ip -6 -o addr show dev "$_d" scope global 2>/dev/null | awk '{print $4}' | head -1)"
+        _v4="$(ip -4 -o addr show dev "$_d" scope global 2>/dev/null | awk '{print $4}' | head -1)"
+        printf '   %s┃%s %s◈%s %s%s%s  %s 条  %s\n' \
+          "$BORD" "$RST" "$SKY_B" "$RST" "$BOLD_W" "$_d" "$RST" "$_n" \
+          "${_v6:-}${_v4:+ / $_v4}"
+      done
     else
-      printf '%s◈%s 设备 %s%s%s %s\n' "$SKY_B" "$RST" "$GRA" "$DEV" "$RST" "$(st_badge "$GRA" "未建")"
-    fi
-    if dev_exists "$DEV"; then
-      _v6="$(ip -6 -o addr show dev "$DEV" scope global 2>/dev/null | awk '{print $4}' | head -1)"
-      _v4="$(ip -4 -o addr show dev "$DEV" scope global 2>/dev/null | awk '{print $4}' | head -1)"
-      printf '   %s┃%s %s◈%s IPv6 %s\n' "$BORD" "$RST" "$VIO_B" "$RST" "${_v6:-无}"
-      printf '   %s┃%s %s◈%s IPv4 %s\n' "$BORD" "$RST" "$LIME_B" "$RST" "${_v4:-无}"
+      printf '   %s┃%s %s◈%s 设备 %s（未建）\n' "$BORD" "$RST" "$SKY_B" "$RST" "$DEV"
     fi
     echo
     item "1" "建网桥（$DEV）"
@@ -838,21 +1406,25 @@ cmd_menu() {
     echo
     item "3" "查看状态"
     item "4" "生成地址（/128 或 /32）"
-    item "5" "删除网桥"
-    item "6" "数据更新（CSV 缓存）"
-    item "7" "帮助"
+    item "5" "删除（地址 / 设备）"
+    item "6" "保存 / 开机恢复"
+    item "7" "操作日志"
+    item "8" "数据更新（CSV 缓存）"
+    item "9" "帮助"
     item "0" "退出"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-7]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-9]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
     case "$c" in
       1) ui_v6or4; pause ;;
       2) ui_add; pause ;;
       3) cmd_status; pause ;;
       4) ui_gen; pause ;;
-      5) if ask "删除设备 $DEV？"; then echo; cmd_down; fi; pause ;;
-      6) ui_data; pause ;;
-      7) ui_help; pause ;;
+      5) ui_del; pause ;;
+      6) ui_save; pause ;;
+      7) ui_log; pause ;;
+      8) ui_data; pause ;;
+      9) ui_help; pause ;;
       0) printf '\n  %s再见 👋%s\n\n' "$TEAL_B" "$RST"; exit 0 ;;
       *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
@@ -868,6 +1440,19 @@ ui_v6or4() {
   case "$UI_IN" in
     1) echo; cmd_v6 ;;
     2) echo; cmd_v4 ;;
+    *) dim "已取消" ;;
+  esac
+}
+
+ui_del() {
+  hr "删除"
+  item "1" "删除一个地址（列出所有设备上的）"
+  item "2" "删除整个设备"
+  echo
+  readline "选择 [1-2]，回车取消：" ""
+  case "$UI_IN" in
+    1) echo; cmd_del_addr ;;
+    2) echo; cmd_del_dev ;;
     *) dim "已取消" ;;
   esac
 }
@@ -958,8 +1543,16 @@ usage() {
   fip data status         看 CSV 缓存（文件、行数、更新时间、自动更新设置）
   fip data refresh        立即更新
   fip data auto off|daily|weekly|monthly   设置自动更新（默认 off）
-  fip status              看设备和地址
-  fip down                删除设备
+  fip status              看所有 fip* 设备和地址（带序号）
+  fip del-addr            列出所有地址，选序号删除
+  fip del-dev             列出所有设备，选序号删除
+  fip down                删除默认设备
+  fip save                保存当前设备+地址到 /etc/fip/state
+  fip restore             立即恢复
+  fip unsave              删除保存
+  fip boot-install        安装开机自动恢复
+  fip boot-remove         卸载开机自动恢复
+  fip log [status|tail [n]|clear]   操作日志
   fip gen6 / gen4         生成 /128 或 /32
   fip help / version
 
@@ -982,11 +1575,14 @@ usage() {
   FIP_V4=175.45.176.0/22       IPv4 默认段
   FIP_CSV_URL=...              Cloudflare CSV 地址
   FIP_CSV_CACHE=/var/tmp/fip-country.csv
+  FIP_LOG=/var/log/fip.log     操作日志路径
+  LOG_MAX_KB=512               超过就轮转
+  LOG_KEEP=3                   保留旧日志个数
   FIP_COLOR=0                  关颜色
   FIP_MENU=0                   无参数不进菜单
 
 安装：
-  install -m 755 fip-v4.3.sh /usr/local/bin/fip
+  install -m 755 fip-v4.7.sh /usr/local/bin/fip
 EOF
 }
 
@@ -1009,6 +1605,12 @@ case "${1:-}" in
           _cc="$2"; shift 2
           cmd_add --country "$_cc" "$@" ;;
       esac ;;
+  log|logs)           cmd_log "${2:-status}" "${3:-30}" ;;
+  save)               save_state ;;
+  restore)            restore_state ;;
+  unsave)             unsave_state ;;
+  boot-install)       install_boot ;;
+  boot-remove)        uninstall_boot ;;
   data|csv)
       case "${2:-status}" in
         status|''|show) cmd_csv_status ;;
@@ -1016,6 +1618,8 @@ case "${1:-}" in
         auto|ttl) cmd_csv_ttl "${3:-}" ;;
         *) err "用法：fip data [status|refresh|auto off|daily|weekly|monthly]" ;;
       esac ;;
+  del-addr|rmaddr)   cmd_del_addr ;;
+  del-dev|rmdev)     cmd_del_dev ;;
   status|show|stat)  cmd_status ;;
   down|off|del|delete) cmd_down ;;
   gen6)              gen_v6_128 ;;
