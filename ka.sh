@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.2.1        归档文件: ka-v<版本>.sh
+#  版本: 0.0.2        归档文件: ka-v<版本>.sh
+#  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
 #    ka                     主菜单（↑↓ 选择，回车确认）
 #    ka install             直接进安装向导
 #    ka status              实例状态
-#    ka logs <n|unit|all>   查看日志
+#    ka logs <n|name|all>   查看日志
 #    ka uninstall           卸载实例
 #    ka version             版本与归档信息
 #    ka bump                发布新版本（+0.1，旧版本文件保留）
@@ -15,15 +16,14 @@
 #
 #  安装流程: 面板地址 → 粘贴 token（一行一个，空行结束）→ 参数 → 确认
 #            节点数量 = token 数量，不再单独问“几个实例”
-#  已有实例: 自动扫描 systemd 里所有跑 komari-agent 的服务，纳入状态/日志/卸载管理
-#  界面: 256 色 / 16 色自动适配；非交互终端退回编号菜单
-#        KA_TUI=0 或 KA_UI=plain 强制纯文本
+#  已有实例: 同时识别 systemd 与 OpenRC(Alpine) 服务，外加正在跑的进程兜底
+#  界面: 256/16 色自适应；非交互终端退回编号菜单（KA_TUI=0 强制）
 # =============================================================================
 
 set -u
 
-KA_VERSION="0.2.1"
-KA_BUMP_STYLE="minor"
+KA_VERSION="0.0.2"
+KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
 
@@ -110,25 +110,6 @@ err()  { printf '  %s%s%s %s\n' "$RED" "$G_ERR" "$RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 dim()  { printf '  %s%s%s\n' "$GRAY" "$*" "$RESET"; }
 
-disp_width() {
-  local s="$1" w=""
-  if command -v wc >/dev/null 2>&1; then
-    w="$(printf '%s' "$s" | wc -L 2>/dev/null | tr -d ' ')"
-  fi
-  case "$w" in ''|*[!0-9]*) w="${#s}" ;; esac
-  printf '%s' "$w"
-}
-
-padr() {
-  local s="$1" w="$2" d
-  d="$(disp_width "$s")"
-  if [ "$d" -lt "$w" ]; then
-    printf '%s%*s' "$s" $((w - d)) ''
-  else
-    printf '%s' "$s"
-  fi
-}
-
 repeat() {
   local ch="$1" n="$2" i out=""
   for ((i = 0; i < n; i++)); do out+="$ch"; done
@@ -146,8 +127,10 @@ rainbow() {
 }
 
 rule() {
-  local w="${1:-58}" seg=$(((w + 3) / 4)) j i s
+  local w="${1:-58}"
+  local seg=$(((w + 3) / 4))
   local -a cols=("$PINK" "$PURP" "$BLUE" "$CYAN")
+  local j i s
   if [ "$COLOR_DEPTH" -eq 0 ]; then
     printf '  %s\n' "$(repeat "$G_RULE" "$w")"
     return 0
@@ -186,9 +169,8 @@ step_header() {
 }
 
 panel_row() {
-  local l="$1" v="$2"
-  printf '  %s%s%s %s%s%s  %s%s%s\n' \
-    "$PURP" "$G_BAR" "$RESET" "$GRAY" "$(padr "$l" 10)" "$RESET" "$WHITE" "$v" "$RESET"
+  printf '  %s%s%s %s%s:%s %s%s%s\n' \
+    "$PURP" "$G_BAR" "$RESET" "$GRAY" "$1" "$RESET" "$WHITE" "$2" "$RESET"
 }
 
 toggle_render() {
@@ -215,6 +197,7 @@ progress() {
 # ================================================================ 交互引擎 ===
 UI_TUI=0
 PICK_RESULT=0
+PICK_START=0
 KEY=""
 
 tui_init() {
@@ -275,12 +258,14 @@ draw_header() {
   printf '\n'
 }
 
-pick() { # 标题 副标题 选项... → PICK_RESULT
+pick() {
   local title="$1" sub="$2"
   shift 2
   local -a items=("$@")
-  local n="${#items[@]}" sel=0 i v
+  local n="${#items[@]}" sel="${PICK_START:-0}" i v
+  PICK_START=0
   if [ "$n" -eq 0 ]; then return 1; fi
+  if [ "$sel" -ge "$n" ]; then sel=0; fi
 
   if [ "$UI_TUI" -eq 0 ]; then
     printf '\n  %s%s%s  %s\n\n' "$PINK" "$G_BAR" "$RESET" "$title"
@@ -332,9 +317,9 @@ pause_any() {
 cfg_row() {
   local idx="$1" sel="$2" label="$3" value="$4"
   if [ "$idx" -eq "$sel" ]; then
-    printf '   %s❯%s %s%s%s  %s\n' "$PINK" "$RESET" "$B" "$(padr "$label" 16)" "$RESET" "$value"
+    printf '   %s❯%s %s%s:%s %s\n' "$PINK" "$RESET" "$B" "$label" "$RESET" "$value"
   else
-    printf '     %s  %s\n' "$(padr "$label" 16)" "$value"
+    printf '     %s:%s %s\n' "$label" "$RESET" "$value"
   fi
 }
 
@@ -484,13 +469,29 @@ mask() {
   fi
 }
 
-# ================================================================ 环境检查 ===
+# ================================================================ 环境/服务 ===
 need_root()    { [ "$(id -u)" -eq 0 ] || die "需要 root 权限，请用 sudo ka"; }
-need_systemd() { command -v systemctl >/dev/null 2>&1 || die "没有 systemctl，本脚本仅支持 systemd 发行版"; }
 need_curl()    { command -v curl >/dev/null 2>&1 || die "没有 curl，请先安装"; }
 
-unit_exists() {
-  systemctl list-unit-files "$1" --no-legend 2>/dev/null | grep -q .
+INIT_SYS=""
+detect_init() {
+  INIT_SYS="none"
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    INIT_SYS="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYS="openrc"
+  elif [ -d /etc/init.d ] && [ -n "$(ls -A /etc/init.d 2>/dev/null)" ]; then
+    INIT_SYS="openrc"
+  fi
+  printf '%s' "$INIT_SYS"
+}
+
+init_label() {
+  case "$1" in
+    systemd) printf 'systemd' ;;
+    openrc)  printf 'OpenRC' ;;
+    *)       printf '未知' ;;
+  esac
 }
 
 inst_dir() {
@@ -511,78 +512,220 @@ build_args() {
   return 0
 }
 
+# 从参数串里解析 -e / -t
+EP=""
+TK=""
+parse_args() {
+  local -a av=($1)
+  local i
+  EP=""; TK=""
+  for ((i = 0; i < ${#av[@]}; i++)); do
+    case "${av[$i]}" in
+      -e|--endpoint) EP="${av[$((i + 1))]:-}" ;;
+      -t|--token)    TK="${av[$((i + 1))]:-}" ;;
+    esac
+  done
+}
+
+svc_state() { # 名字 类型
+  local n="$1" k="$2"
+  case "$k" in
+    systemd) systemctl is-active "$n" 2>/dev/null ;;
+    openrc)
+      if rc-service "$n" status >/dev/null 2>&1; then printf 'active'; else printf 'inactive'; fi ;;
+    proc)
+      if [ -d "/proc/${n#pid-}" ]; then printf 'active'; else printf 'inactive'; fi ;;
+  esac
+}
+
+svc_ctl() { # 动作 名字 类型
+  local act="$1" n="$2" k="$3"
+  case "$k" in
+    systemd) systemctl "$act" "$n" >/dev/null 2>&1 ;;
+    openrc)  rc-service "$n" "$act" >/dev/null 2>&1 ;;
+    proc)
+      case "$act" in
+        stop) kill "${n#pid-}" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+      esac ;;
+  esac
+}
+
+svc_logs() { # 名字 类型 行数
+  local n="$1" k="$2" lines="${3:-100}"
+  case "$k" in
+    systemd)
+      journalctl -u "$n" -n "$lines" --no-pager 2>/dev/null ;;
+    openrc)
+      if [ -f "/var/log/$n.log" ]; then
+        tail -n "$lines" "/var/log/$n.log"
+      elif [ -f /var/log/komari-agent.log ]; then
+        tail -n "$lines" /var/log/komari-agent.log
+      elif command -v logread >/dev/null 2>&1; then
+        logread 2>/dev/null | grep -i "$n" | tail -n "$lines"
+      elif [ -f /var/log/messages ]; then
+        grep -i "$n" /var/log/messages | tail -n "$lines"
+      else
+        return 1
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
 # ============================================================ 已有实例扫描 ===
 D_COUNT=0
-D_UNIT=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
+D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
 
-discover_instances() {
-  D_COUNT=0
-  D_UNIT=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
-  command -v systemctl >/dev/null 2>&1 || return 0
+add_instance() { # 名字 类型 可执行文件 面板 token
+  local name="$1" kind="$2" exe="$3" ep="$4" tk="$5"
+  local dir tag
+  dir="$(dirname "$exe")"
+  tag="外部"
+  case "$name" in
+    "$SVC_PREFIX"|"$SVC_PREFIX"-*) tag="受管" ;;
+  esac
+  case "$dir" in
+    "$BASE_DIR"|"${BASE_DIR%/}"/*|/opt/komari|/opt/komari/*) tag="受管" ;;
+  esac
+  D_NAME+=("$name"); D_KIND+=("$kind"); D_EXE+=("$exe"); D_DIR+=("$dir")
+  D_EP+=("$ep"); D_TK+=("$tk"); D_TAG+=("$tag")
+  D_COUNT=$((D_COUNT + 1))
+}
 
+discover_systemd() {
   local -a units=()
-  local f u line unit exe dir ep tk tag hit
-
-  # 1) 文件名里带 komari-agent 的 unit（一次 grep，避免逐个文件扫）
+  local hit unit line exe
   while IFS= read -r hit; do
-    [ -n "$hit" ] && units+=("$(basename "$hit")")
+    [ -n "$hit" ] && units+=("$(basename "$hit" .service)")
   done <<< "$(grep -lis 'komari-agent' \
       /etc/systemd/system/*.service \
       /usr/lib/systemd/system/*.service \
       /lib/systemd/system/*.service 2>/dev/null)"
-  # 2) 名字匹配但文件没写全路径的兜底
-  while IFS= read -r u; do
-    [ -n "$u" ] && units+=("$u")
+  while IFS= read -r unit; do
+    [ -n "$unit" ] && units+=("${unit%.service}")
   done <<< "$(systemctl list-unit-files 'komari-agent*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}')"
-
   [ "${#units[@]}" -eq 0 ] && return 0
 
   local sorted
   sorted="$(printf '%s\n' "${units[@]}" | sort -u)"
-
-  local -a w=()
   while IFS= read -r unit; do
     [ -n "$unit" ] || continue
-    line="$(systemctl cat "$unit" 2>/dev/null | sed -n 's/^ExecStart=//p' | head -n1)"
+    line="$(systemctl cat "$unit.service" 2>/dev/null | sed -n 's/^ExecStart=//p' | head -n1)"
     [ -n "$line" ] || continue
-    w=($line)
-    exe="${w[0]#-}"; exe="${exe%\"}"; exe="${exe#\"}"
-    case "$exe" in *komari-agent*) ;; *) continue ;; esac
-    ep=""; tk=""
-    local i
-    for ((i = 1; i < ${#w[@]}; i++)); do
-      case "${w[$i]}" in
-        -e|--endpoint) ep="${w[$((i + 1))]:-}" ;;
-        -t|--token)    tk="${w[$((i + 1))]:-}" ;;
-      esac
-    done
-    dir="$(dirname "$exe")"
-    tag="外部"
-    case "$unit" in
-      "$SVC_PREFIX.service"|"$SVC_PREFIX"-*.service) tag="受管" ;;
-    esac
-    D_UNIT+=("$unit"); D_EXE+=("$exe"); D_DIR+=("$dir")
-    D_EP+=("$ep"); D_TK+=("$tk"); D_TAG+=("$tag")
-    D_COUNT=$((D_COUNT + 1))
+    exe="${line%% *}"
+    exe="${exe#-}"; exe="${exe%\"}"; exe="${exe#\"}"
+    case "$exe" in *komari*) ;; *) continue ;; esac
+    parse_args "$line"
+    add_instance "$unit" systemd "$exe" "$EP" "$TK"
   done <<< "$sorted"
 }
 
-remove_unit() { # remove_unit unit [force]
-  local svc="$1" force="${2:-0}" go exe dir ok_dir
-  exe="$(systemctl cat "$svc" 2>/dev/null | sed -n 's/^ExecStart=//p' | head -n1 | awk '{print $1}')"
-  exe="${exe#-}"; exe="${exe%\"}"; exe="${exe#\"}"
-  dir="$(dirname "${exe:-/nonexistent}")"
+discover_openrc() {
+  local f name exe args conf
+  for f in /etc/init.d/*; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    if ! printf '%s' "$name" | grep -qi 'komari'; then
+      grep -qi 'komari' "$f" 2>/dev/null || continue
+    fi
+    exe="$(sed -n 's/^[[:space:]]*command=//p' "$f" 2>/dev/null | head -n1 | tr -d '"')"
+    args="$(sed -n 's/^[[:space:]]*command_args=//p' "$f" 2>/dev/null | head -n1 | tr -d '"')"
+    conf="/etc/conf.d/$name"
+    if [ -z "$exe" ] && [ -f "$conf" ]; then
+      exe="$(sed -n 's/^[[:space:]]*command=//p' "$conf" 2>/dev/null | head -n1 | tr -d '"')"
+      args="$(sed -n 's/^[[:space:]]*command_args=//p' "$conf" 2>/dev/null | head -n1 | tr -d '"')"
+    fi
+    if [ -z "$exe" ]; then continue; fi
+    parse_args "$args"
+    add_instance "$name" openrc "$exe" "$EP" "$TK"
+  done
+}
+
+init_for_exe() { # 用可执行文件路径反查是哪个 init 脚本
+  local exe="$1" f
+  for f in /etc/init.d/*; do
+    [ -f "$f" ] || continue
+    if grep -qF "$exe" "$f" 2>/dev/null; then
+      basename "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+discover_procs() {
+  local p cmd exe pid i covered
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    cmd="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)"
+    [ -n "$cmd" ] || continue
+    exe="${cmd%% *}"
+    case "$exe" in *komari*) ;; *) continue ;; esac
+    pid="${p#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    parse_args "$cmd"
+    covered=0
+    for ((i = 0; i < D_COUNT; i++)); do
+      if [ "${D_EXE[$i]}" = "$exe" ]; then covered=$((i + 1)); break; fi
+    done
+    if [ "$covered" -gt 0 ]; then
+      # 服务已登记，用真实命令行补全缺失的面板地址 / token
+      local j=$((covered - 1))
+      if [ -z "${D_EP[$j]}" ] && [ -n "$EP" ]; then D_EP[$j]="$EP"; fi
+      if [ -z "${D_TK[$j]}" ] && [ -n "$TK" ]; then D_TK[$j]="$TK"; fi
+      continue
+    fi
+    local svc
+    if svc="$(init_for_exe "$exe")"; then
+      add_instance "$svc" openrc "$exe" "$EP" "$TK"
+    else
+      add_instance "pid-$pid" proc "$exe" "$EP" "$TK"
+    fi
+  done
+}
+
+discover_instances() {
+  D_COUNT=0
+  D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
+  detect_init >/dev/null
+  case "$INIT_SYS" in
+    systemd) discover_systemd ;;
+    openrc)  discover_openrc ;;
+  esac
+  discover_procs
+}
+
+count_managed() {
+  local i n=0
+  for ((i = 0; i < D_COUNT; i++)); do
+    if [ "${D_TAG[$i]}" = "受管" ]; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+
+remove_index() { # 下标 [force]
+  local idx="$1" force="${2:-0}"
+  local n="${D_NAME[$idx]}" k="${D_KIND[$idx]}" dir="${D_DIR[$idx]}" go ok_dir
   if [ "$force" -eq 0 ]; then
-    warn "将停止并删除 ${svc%.service}，目录 $dir"
+    warn "将停止并删除 $n（$k），目录 $dir"
     ask "确认? (y/N)" "N" go
     case "$go" in
       [Yy]*) ;;
       *) warn "已跳过"; return 0 ;;
     esac
   fi
-  systemctl disable --now "$svc" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${svc%.service}.service"
-  systemctl daemon-reload
+  case "$k" in
+    systemd)
+      systemctl disable --now "$n" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$n.service"
+      systemctl daemon-reload ;;
+    openrc)
+      rc-service "$n" stop >/dev/null 2>&1 || true
+      rc-update del "$n" default >/dev/null 2>&1 || true
+      rm -f "/etc/init.d/$n" ;;
+    proc)
+      kill "${n#pid-}" >/dev/null 2>&1 || true ;;
+  esac
   ok_dir=0
   case "$dir" in
     /opt/komari*|/opt/ka*) ok_dir=1 ;;
@@ -592,11 +735,11 @@ remove_unit() { # remove_unit unit [force]
       "$BASE_DIR"|"${BASE_DIR%/}"/*) ok_dir=1 ;;
     esac
   fi
-  if [ "$ok_dir" -eq 1 ]; then
+  if [ "$ok_dir" -eq 1 ] && [ "$k" != "proc" ]; then
     rm -rf "$dir"
-    ok "${svc%.service} 已卸载，目录 $dir 已删除"
+    ok "$n 已卸载，目录 $dir 已删除"
   else
-    warn "${svc%.service} 已卸载；目录 $dir 不在白名单，保留未删"
+    ok "$n 已卸载"
   fi
 }
 
@@ -753,6 +896,14 @@ step_advanced_plain() {
   done
 }
 
+service_name_taken() {
+  local name="$1" i
+  for ((i = 0; i < D_COUNT; i++)); do
+    if [ "${D_NAME[$i]}" = "$name" ]; then return 0; fi
+  done
+  return 1
+}
+
 step_confirm() {
   build_args
   step_header 4 4 "确认部署"
@@ -760,7 +911,7 @@ step_confirm() {
   local clash="" i svc
   for ((i = 1; i <= INSTANCE_COUNT; i++)); do
     svc="$(inst_svc "$i")"
-    if unit_exists "$svc.service"; then clash+=" $svc"; fi
+    if service_name_taken "$svc"; then clash+=" $svc"; fi
   done
 
   panel_row "面板地址" "$ENDPOINT"
@@ -775,7 +926,7 @@ step_confirm() {
   panel_row "根目录"   "$BASE_DIR"
   blank
   for ((i = 1; i <= INSTANCE_COUNT; i++)); do
-    printf '  %s%s%s %s#%s%s %s%-14s%s %s→ %s%s\n' \
+    printf '  %s%s%s %s#%s%s %s%s%s %s→ %s%s\n' \
       "$PURP" "$G_BAR" "$RESET" "$GRAY" "$i" "$RESET" \
       "$GRAY" "$(mask "${TOKENS[$((i - 1))]}")" "$RESET" \
       "$GRAY" "$(inst_dir "$i")" "$RESET"
@@ -796,7 +947,7 @@ step_confirm() {
 }
 
 do_install() {
-  need_root; need_systemd; need_curl
+  need_root; need_curl
   save_conf
   build_args
   local tmp i token dir svc fails=0
@@ -815,10 +966,17 @@ do_install() {
     progress "$i" "$INSTANCE_COUNT"
     printf '  %s%s%s %s%s%s  %stoken %s%s\n' \
       "$PINK" "$G_BAR" "$RESET" "$B" "$svc" "$RESET" "$GRAY" "$(mask "$token")" "$RESET"
-    systemctl stop "$svc" >/dev/null 2>&1 || true
+    case "$INIT_SYS" in
+      systemd) systemctl stop "$svc" >/dev/null 2>&1 || true ;;
+      openrc)  rc-service "$svc" stop >/dev/null 2>&1 || true ;;
+    esac
     if bash "$tmp" "${ARGS[@]}" \
          -t "$token" --install-dir "$dir" --install-service-name "$svc" </dev/null; then
-      systemctl enable --now "$svc" >/dev/null 2>&1 || true
+      case "$INIT_SYS" in
+        systemd) systemctl enable --now "$svc" >/dev/null 2>&1 || true ;;
+        openrc)  rc-service "$svc" start >/dev/null 2>&1 || true
+                 rc-update add "$svc" default >/dev/null 2>&1 || true ;;
+      esac
       ok "$svc 已安装并启动"
     else
       err "$svc 安装失败"
@@ -833,12 +991,11 @@ do_install() {
   printf '  %s%s 部署结果 %s\n\n' "$B" "▍" "$RESET"
   for ((i = 1; i <= INSTANCE_COUNT; i++)); do
     svc="$(inst_svc "$i")"
-    local act; act="$(systemctl is-active "$svc" 2>/dev/null)"
-    if [ "$act" = "active" ]; then
-      printf '  %s%s%s %-24s %s运行中%s\n' "$GREEN" "$G_DOT" "$RESET" "$svc" "$GREEN" "$RESET"
-    else
-      printf '  %s%s%s %-24s %s%s%s\n' "$RED" "$G_DOT_OFF" "$RESET" "$svc" "$RED" "$act" "$RESET"
-    fi
+    local st_text act col dot
+    act="$(svc_state "$svc" "$INIT_SYS")"
+    if [ "$act" = "active" ]; then col="$GREEN"; dot="$G_DOT"; st_text="运行中"
+    else col="$RED"; dot="$G_DOT_OFF"; st_text="$act"; fi
+    printf '  %s%s%s %s %s%s%s\n' "$col" "$dot" "$RESET" "$svc" "$col" "$st_text" "$RESET"
   done
   blank
   if [ "$fails" -eq 0 ]; then
@@ -854,16 +1011,17 @@ cmd_wizard() {
   load_conf
   CANCELED=0
   discover_instances
+  detect_init >/dev/null
 
   if [ "$UI_TUI" -eq 1 ]; then screen_home; fi
   banner
 
   if [ "$D_COUNT" -gt 0 ]; then
-    panel_row "已有实例" "${D_COUNT} 个"
+    panel_row "已有实例" "$D_COUNT 个（$(init_label "$INIT_SYS")）"
     local j
     for ((j = 0; j < D_COUNT; j++)); do
-      printf '  %s%s%s %s%-22s%s %s%s%s\n' \
-        "$PURP" "$G_BAR" "$RESET" "$GRAY" "${D_UNIT[$j]%.service}" "$RESET" \
+      printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$PURP" "$G_BAR" "$RESET" "$WHITE" "${D_NAME[$j]}" "$RESET" \
         "$GRAY" "${D_DIR[$j]}" "$RESET"
     done
     blank
@@ -886,50 +1044,73 @@ cmd_wizard() {
 
 # ================================================================== 子命令 ===
 cmd_status() {
-  need_systemd
   load_conf
   discover_instances
+  detect_init >/dev/null
 
   if [ "$D_COUNT" -eq 0 ]; then
-    warn "没有发现已安装的 komari-agent"
+    warn "没有发现已安装的 komari-agent（$(init_label "$INIT_SYS")）"
     return 0
   fi
 
-  printf '\n  %s%s%s %s实例状态%s %s(%s 个)%s\n' \
-    "$PURP" "$G_BAR" "$RESET" "$B" "$RESET" "$GRAY" "$D_COUNT" "$RESET"
-  rule 64
-  local i act en col dot tag
+  printf '\n  %s%s%s %s实例状态%s %s(%s 个 · %s)%s\n' \
+    "$PURP" "$G_BAR" "$RESET" "$B" "$RESET" "$GRAY" "$D_COUNT" "$(init_label "$INIT_SYS")" "$RESET"
+  rule 66
+  local i act col dot tag
   for ((i = 0; i < D_COUNT; i++)); do
-    act="$(systemctl is-active "${D_UNIT[$i]}" 2>/dev/null)"
-    en="$(systemctl is-enabled "${D_UNIT[$i]}" 2>/dev/null)"
+    act="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
     case "$act" in
       active)   col="$GREEN"; dot="$G_DOT";     tag="运行中" ;;
       failed)   col="$RED";   dot="$G_ERR";     tag="失败" ;;
       inactive) col="$GRAY";  dot="$G_DOT_OFF"; tag="已停止" ;;
       *)        col="$YELL";  dot="$G_DOT_OFF"; tag="$act" ;;
     esac
-    printf '  %s%s%s %s%-22s%s %s%s%s %s%-7s%s %s%s%s\n' \
+    printf '  %s%s%s %s%s%s  %s%s%s  %s%s%s  %s%s%s\n' \
       "$col" "$dot" "$RESET" \
-      "$GRAY" "${D_UNIT[$i]%.service}" "$RESET" \
+      "$WHITE" "${D_NAME[$i]}" "$RESET" \
       "$CYAN" "${D_TAG[$i]}" "$RESET" \
-      "$col" "$(padr "$tag" 7)" "$RESET" \
+      "$col" "$tag" "$RESET" \
       "$GRAY" "${D_EP[$i]:-—}" "$RESET"
   done
-  rule 64
+  rule 66
   local conns="未知"
   if command -v ss >/dev/null 2>&1; then
-    conns="$(ss -tnp 2>/dev/null | grep -c 'komari-agent')"
+    conns="$(ss -tnp 2>/dev/null | grep -c 'komari')"
   fi
   printf '  %s共 %s 个 · 面板连接 %s 条 · 受管 %s 个%s\n\n' \
     "$GRAY" "$D_COUNT" "$conns" "$(count_managed)" "$RESET"
 }
 
-count_managed() {
-  local i n=0
+cmd_doctor() {
+  load_conf
+  discover_instances
+  detect_init >/dev/null
+  if [ "$D_COUNT" -eq 0 ]; then
+    warn "没有发现实例；先 ka install"
+    return 0
+  fi
+  printf '\n  %s%s%s %s自检%s\n' "$PURP" "$G_BAR" "$RESET" "$B" "$RESET"
+  rule 60
+  local i act okc=0 code
   for ((i = 0; i < D_COUNT; i++)); do
-    if [ "${D_TAG[$i]}" = "受管" ]; then n=$((n + 1)); fi
+    act="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
+    if [ "$act" = "active" ]; then
+      printf '  %s%s%s %s  服务运行中\n' "$GREEN" "$G_OK" "$RESET" "${D_NAME[$i]}"
+      okc=$((okc + 1))
+    else
+      printf '  %s%s%s %s  服务未运行（%s）\n' "$RED" "$G_ERR" "$RESET" "${D_NAME[$i]}" "$act"
+    fi
+    if [ -n "${D_EP[$i]}" ]; then
+      code="$(curl -o /dev/null -sS -k -w '%{http_code}' --max-time 6 "${D_EP[$i]}" 2>/dev/null || printf '000')"
+      if [ "$code" = "000" ]; then
+        printf '  %s%s%s %s  面板连不上 %s\n' "$YELL" "$G_WARN" "$RESET" "  " "${D_EP[$i]}"
+      else
+        printf '  %s%s%s %s  面板可达 HTTP %s\n' "$GREEN" "$G_OK" "$RESET" "  " "$code"
+      fi
+    fi
   done
-  printf '%s' "$n"
+  rule 60
+  printf '  %s%d/%d 个实例在运行%s\n\n' "$GRAY" "$okc" "$D_COUNT" "$RESET"
 }
 
 cmd_instances() {
@@ -942,8 +1123,8 @@ cmd_instances() {
   local -a items=()
   local i st
   for ((i = 0; i < D_COUNT; i++)); do
-    st="$(systemctl is-active "${D_UNIT[$i]}" 2>/dev/null)"
-    items+=("$(padr "${D_UNIT[$i]%.service}" 22)  ${D_TAG[$i]}  ${st}")
+    st="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
+    items+=("${D_NAME[$i]}  [${D_TAG[$i]}]  $st")
   done
   pick "实例管理" "共 ${D_COUNT} 个 · 选择后查看详情" "${items[@]}" || return 0
   cmd_instance_actions "$PICK_RESULT"
@@ -951,58 +1132,72 @@ cmd_instances() {
 
 cmd_instance_actions() {
   local idx="$1"
-  local unit="${D_UNIT[$idx]}"
-  local name="${unit%.service}"
+  local n="${D_NAME[$idx]}" k="${D_KIND[$idx]}"
   local st
   while :; do
-    st="$(systemctl is-active "$unit" 2>/dev/null)"
+    st="$(svc_state "$n" "$k")"
     local -a items=("查看日志" "重启" "停止" "启动" "卸载")
-    pick "$name" "状态 $st · ${D_DIR[$idx]} · ${D_EP[$idx]:-—}" "${items[@]}" || return 0
+    if [ "$k" = "proc" ]; then
+      items=("查看命令行" "停止进程" "卸载记录")
+    fi
+    pick "$n" "类型 $k · 状态 $st · ${D_DIR[$idx]}" "${items[@]}" || return 0
+    if [ "$k" = "proc" ]; then
+      case "$PICK_RESULT" in
+        0) printf '\n  %s\n\n' "$(tr '\0' ' ' < "/proc/${n#pid-}/cmdline" 2>/dev/null)"
+           pause_any ;;
+        1) svc_ctl stop "$n" "$k" && ok "已向 $n 发送 TERM" || warn "操作失败"
+           pause_any ;;
+        2) remove_index "$idx"; return 0 ;;
+      esac
+      continue
+    fi
     case "$PICK_RESULT" in
-      0)
-        printf '\n'
-        journalctl -u "$unit" -n 100 --no-pager 2>/dev/null || warn "读取日志失败"
-        pause_any ;;
-      1) systemctl restart "$unit" >/dev/null 2>&1 && ok "已重启 $name" || warn "重启失败"
+      0) printf '\n'
+         if ! svc_logs "$n" "$k" 100; then warn "没有可读的日志（$k）"; fi
          pause_any ;;
-      2) systemctl stop "$unit" >/dev/null 2>&1 && ok "已停止 $name" || warn "停止失败"
+      1) svc_ctl restart "$n" "$k" && ok "已重启 $n" || warn "重启失败"
          pause_any ;;
-      3) systemctl start "$unit" >/dev/null 2>&1 && ok "已启动 $name" || warn "启动失败"
+      2) svc_ctl stop "$n" "$k" && ok "已停止 $n" || warn "停止失败"
          pause_any ;;
-      4) remove_unit "$unit"; return 0 ;;
+      3) svc_ctl start "$n" "$k" && ok "已启动 $n" || warn "启动失败"
+         pause_any ;;
+      4) remove_index "$idx"; return 0 ;;
     esac
   done
 }
 
 cmd_logs() {
-  need_systemd
   load_conf
-  local id="${1:-1}" lines="${2:-80}" args=() u
+  local id="${1:-1}" lines="${2:-80}"
+  discover_instances
+  if [ "$D_COUNT" -eq 0 ]; then die "没有安装任何实例"; fi
+
+  local -a names=()
+  local i
+  for ((i = 0; i < D_COUNT; i++)); do names+=("${D_NAME[$i]}"); done
+
+  local targets=()
   case "$id" in
     all)
-      discover_instances
-      [ "$D_COUNT" -eq 0 ] && die "没有安装任何实例"
-      local i
-      for ((i = 0; i < D_COUNT; i++)); do args+=(-u "${D_UNIT[$i]}"); done ;;
+      for ((i = 0; i < D_COUNT; i++)); do targets+=("$i"); done ;;
     *[!0-9]*)
-      if unit_exists "$id"; then
-        args+=(-u "$id")
-      elif unit_exists "$id.service"; then
-        args+=(-u "$id.service")
-      else
-        die "找不到实例 $id"
-      fi ;;
+      for ((i = 0; i < D_COUNT; i++)); do
+        if [ "${D_NAME[$i]}" = "$id" ]; then targets+=("$i"); break; fi
+      done
+      [ "${#targets[@]}" -eq 0 ] && die "找不到实例 $id" ;;
     *)
-      discover_instances
       local idx=$((id - 1))
       if [ "$idx" -lt 0 ] || [ "$idx" -ge "$D_COUNT" ]; then die "编号超出范围"; fi
-      args+=(-u "${D_UNIT[$idx]}") ;;
+      targets=("$idx") ;;
   esac
-  journalctl "${args[@]}" -n "$lines" --no-pager 2>/dev/null || die "读取日志失败"
+
+  for i in "${targets[@]}"; do
+    svc_logs "${D_NAME[$i]}" "${D_KIND[$i]}" "$lines" || warn "${D_NAME[$i]} 没有可读日志"
+  done
 }
 
 cmd_uninstall() {
-  need_root; need_systemd
+  need_root
   load_conf
   discover_instances
   if [ "$D_COUNT" -eq 0 ]; then warn "没有可卸载的实例"; return 0; fi
@@ -1010,7 +1205,7 @@ cmd_uninstall() {
   local -a items=()
   local i
   for ((i = 0; i < D_COUNT; i++)); do
-    items+=("$(padr "${D_UNIT[$i]%.service}" 22)  ${D_TAG[$i]}")
+    items+=("${D_NAME[$i]}  [${D_TAG[$i]}]")
   done
   items+=("全部卸载")
   pick "卸载实例" "选择要删除的实例" "${items[@]}" || return 0
@@ -1024,10 +1219,10 @@ cmd_uninstall() {
       *) warn "已取消"; return 0 ;;
     esac
     for ((i = 0; i < D_COUNT; i++)); do
-      remove_unit "${D_UNIT[$i]}" 1
+      remove_index "$i" 1
     done
   else
-    remove_unit "${D_UNIT[$PICK_RESULT]}"
+    remove_index "$PICK_RESULT"
   fi
 }
 
@@ -1104,6 +1299,7 @@ cmd_version() {
   panel_row "运行文件" "$KA_SELF"
   panel_row "发布目录" "$KA_DIR"
   panel_row "配置文件" "$KA_CONF"
+  panel_row "初始化"   "$(init_label "$(detect_init)")"
   panel_row "版本规则" "$KA_BUMP_STYLE（minor: +0.1）"
   blank
   printf '  %s%s%s %s归档版本%s\n' "$PURP" "$G_BAR" "$RESET" "$B" "$RESET"
@@ -1126,8 +1322,9 @@ cmd_help() {
     ka install            直接进入安装向导
 
   ${B}管理${RESET}
-    ka status             实例状态（含已存在的实例）
-    ka logs <n|unit|all>  查看日志，默认 80 行
+    ka status             实例状态（systemd / OpenRC 都认）
+    ka doctor             一键自检（服务 + 面板连通）
+    ka logs <n|name|all>  查看日志，默认 80 行
     ka uninstall          卸载实例
 
   ${B}版本${RESET}
@@ -1152,18 +1349,21 @@ cmd_menu() {
   local sub
   while :; do
     discover_instances
+    detect_init >/dev/null
     case "$D_COUNT" in
-      0) sub="未发现已安装实例" ;;
-      1) sub="已发现 1 个已安装实例" ;;
-      *) sub="已发现 ${D_COUNT} 个已安装实例" ;;
+      0) sub="未发现已安装实例（$(init_label "$INIT_SYS")）" ;;
+      1) sub="已发现 1 个已安装实例（$(init_label "$INIT_SYS")）" ;;
+      *) sub="已发现 ${D_COUNT} 个已安装实例（$(init_label "$INIT_SYS")）" ;;
     esac
-    items=("安装 / 新增实例" "实例管理" "版本信息" "退出")
+    items=("安装 / 新增实例" "实例管理" "自检 / 诊断" "版本信息" "退出")
+    if [ "$D_COUNT" -gt 0 ]; then PICK_START=1; fi
     pick "主菜单" "$sub" "${items[@]}" || return 0
     case "$PICK_RESULT" in
       0) cmd_wizard; pause_any ;;
       1) cmd_instances; pause_any ;;
-      2) cmd_version; pause_any ;;
-      3) return 0 ;;
+      2) cmd_doctor; pause_any ;;
+      3) cmd_version; pause_any ;;
+      4) return 0 ;;
     esac
   done
 }
@@ -1176,6 +1376,7 @@ main() {
     menu|'')              cmd_menu ;;
     wizard|install)       cmd_wizard ;;
     status)               cmd_status ;;
+    doctor|check)         cmd_doctor ;;
     logs)                 cmd_logs "$@" ;;
     uninstall|remove)     cmd_uninstall ;;
     version|-v|--version) cmd_version ;;
