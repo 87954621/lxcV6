@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.0.6        归档文件: ka-v<版本>.sh
+#  版本: 0.0.8        归档文件: ka-v<版本>.sh
 #  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
@@ -22,7 +22,7 @@
 
 set -u
 
-KA_VERSION="0.0.6"
+KA_VERSION="0.0.8"
 KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
@@ -924,6 +924,54 @@ count_managed() {
 # ---------------------------------------------------------------- 元数据 ---
 META_FILE="${KA_META:-/etc/ka-meta.tsv}"
 
+http_get() { curl -fsSL --max-time 4 "$1" 2>/dev/null; }
+
+detect_public_ip() {
+  local u ip
+  for u in "https://api.ip.sb/ip" "https://ipinfo.io/ip"; do
+    ip="$(http_get "$u" | tr -d '[:space:]')"
+    case "$ip" in
+      ''|*[!0-9a-fA-F:.]*) continue ;;
+    esac
+    printf '%s' "$ip"
+    return 0
+  done
+  return 1
+}
+
+detect_geo_label() {
+  local ip="$1" j c cy
+  j="$(http_get "http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,country,city")"
+  if printf '%s' "$j" | grep -q '"status":"success"'; then
+    c="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+    cy="$(printf '%s' "$j" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')"
+    if [ -n "$c" ] && [ -n "$cy" ]; then printf '%s·%s' "$c" "$cy"; return 0; fi
+    if [ -n "$c" ]; then printf '%s' "$c"; return 0; fi
+  fi
+  j="$(http_get "https://ipinfo.io/${ip}/json")"
+  c="$(printf '%s' "$j" | sed -n 's/.*"country": *"\([^"]*\)".*/\1/p')"
+  cy="$(printf '%s' "$j" | sed -n 's/.*"city": *"\([^"]*\)".*/\1/p')"
+  if [ -n "$c" ] && [ -n "$cy" ]; then printf '%s·%s' "$c" "$cy"; return 0; fi
+  if [ -n "$c" ]; then printf '%s' "$c"; fi
+  return 0
+}
+
+GEO_TRIED=0
+GEO_IP=""
+GEO_RESULT=""
+geo_note() {
+  GEO_RESULT=""
+  [ "${KA_NO_GEO:-0}" = "1" ] && return 0
+  if [ "$GEO_TRIED" -eq 0 ]; then
+    GEO_TRIED=1
+    GEO_IP="$(detect_public_ip || true)"
+    if [ -n "$GEO_IP" ]; then
+      GEO_RESULT="$(detect_geo_label "$GEO_IP")"
+    fi
+  fi
+  return 0
+}
+
 meta_get() {
   [ -f "$META_FILE" ] || return 0
   awk -F "$(printf '\t')" -v k="$1" '$1 == k { print $2; exit }' "$META_FILE" 2>/dev/null
@@ -1168,6 +1216,10 @@ adv_run() { # 标题 副标题 绘制函数 编辑函数 项数
   blank
 }
 
+ADV_MORE_DRAW="adv_draw2"
+ADV_MORE_EDIT="adv_edit2"
+ADV_MORE_N=8
+
 adv_draw1() {
   local s="$1"
   cfg_row 0 "$s" "采集间隔"       "${YELL}${INTERVAL}${RESET} 秒"
@@ -1188,7 +1240,7 @@ adv_edit1() {
     3) [ "$DISABLE_AUTOUPDATE" -eq 1 ] && DISABLE_AUTOUPDATE=0 || DISABLE_AUTOUPDATE=1 ;;
     4) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
     5) [ "$GPU_MONITOR" -eq 1 ] && GPU_MONITOR=0 || GPU_MONITOR=1 ;;
-    6) adv_run "更多设置" "网卡 / 挂载点 / 安装项" adv_draw2 adv_edit2 8 ;;
+    6) adv_run "更多设置" "网卡 / 挂载点 / 安装项" "$ADV_MORE_DRAW" "$ADV_MORE_EDIT" "$ADV_MORE_N" ;;
     7) return 1 ;;
   esac
   return 0
@@ -1230,6 +1282,29 @@ adv_edit2() {
     5) edit_str "GitHub 代理（如 https://ghproxy.net，空=直连）" GH_PROXY ;;
     6) edit_str "额外参数（原样传给 agent，空=无）" EXTRA_AGENT ;;
     7) return 1 ;;
+  esac
+  return 0
+}
+
+# 修改已安装实例的参数时用这一屏（没有安装版本/代理）
+inst_draw2() {
+  local s="$1"
+  cfg_row 0 "$s" "包含网卡"     "${WHITE}${INCLUDE_NICS:-全部}${RESET}"
+  cfg_row 1 "$s" "排除网卡"     "${WHITE}${EXCLUDE_NICS:-无}${RESET}"
+  cfg_row 2 "$s" "包含挂载点"   "${WHITE}${MOUNT_POINTS:-全部}${RESET}"
+  cfg_row 3 "$s" "月重置日"     "${YELL}${MONTH_ROTATE}${RESET}（0=关闭）"
+  cfg_row 4 "$s" "额外参数"     "${WHITE}${EXTRA_AGENT:-无}${RESET}"
+  cfg_row 5 "$s" "返回"         "${GREEN}←${RESET}"
+}
+
+inst_edit2() {
+  case "$1" in
+    0) multi_nics "包含网卡" "勾选要统计的网卡；全不选=全部" INCLUDE_NICS ;;
+    1) multi_nics "排除网卡" "勾选要排除的网卡" EXCLUDE_NICS ;;
+    2) multi_mounts ;;
+    3) edit_int "月重置日（1-31，0=关闭）" MONTH_ROTATE 0 31 ;;
+    4) edit_str "额外参数（原样传给 agent，空=无）" EXTRA_AGENT ;;
+    5) return 1 ;;
   esac
   return 0
 }
@@ -1590,6 +1665,7 @@ cmd_instance_actions() {
     else
       acts+=(start); labels+=("启动服务")
     fi
+    acts+=(params); labels+=("修改参数 · 采集 / 开关 / 网络")
     if [ "${D_TAG[$idx]}" = "受管" ]; then
       acts+=(upgrade); labels+=("升级 Agent · 沿用现有参数")
     fi
@@ -1615,6 +1691,7 @@ cmd_instance_actions() {
     restart) svc_ctl restart "$n" "$k" && ok "已重启 $n" || warn "重启失败" ;;
     stop)    svc_ctl stop "$n" "$k" && ok "已停止 $n" || warn "停止失败" ;;
     start)   svc_ctl start "$n" "$k" && ok "已启动 $n" || warn "启动失败" ;;
+    params)  cmd_edit_params "$idx" ;;
     upgrade) cmd_upgrade "$n" ;;
     adopt)   cmd_adopt "$n" ;;
     note)    cmd_note "$n" ;;
@@ -1642,10 +1719,113 @@ cmd_note() {
     pick "设置备注" "地区 / 用途，留空清除" "${items[@]}" || return 0
     idx="$PICK_RESULT"
   fi
-  local name="${D_NAME[$idx]}" old note
+  local name="${D_NAME[$idx]}" old note def
   old="$(meta_get "$name")"
-  ask "备注（当前: ${old:-无}）" "$old" note
+  def="$old"
+  if [ -z "$old" ] && [ "${KA_NO_GEO:-0}" != "1" ]; then
+    info "识别出口 IP 归属地…"
+    geo_note
+    if [ -n "$GEO_RESULT" ]; then
+      dim "公网 IP ${GEO_IP} → ${GEO_RESULT}"
+      def="$GEO_RESULT"
+    else
+      warn "识别失败（网络受限？），手动填写即可"
+    fi
+  fi
+  ask "备注（地区 / 用途，输入 - 清空）" "$def" note
+  if [ "$note" = "-" ]; then note=""; fi
   meta_set "$name" "$note" && ok "$name 备注 → ${note:-（空）}"
+}
+
+reset_settings() {
+  INTERVAL="1.0"
+  INFO_INTERVAL="5"
+  DISABLE_WEBSSH=0
+  DISABLE_AUTOUPDATE=0
+  MEM_AVAILABLE=0
+  INSECURE=0
+  GPU_MONITOR=0
+  INCLUDE_NICS=""
+  EXCLUDE_NICS=""
+  MOUNT_POINTS=""
+  MONTH_ROTATE="0"
+  EXTRA_AGENT=""
+}
+
+load_settings_from_args() {
+  reset_settings
+  local -a av=($1)
+  local i a
+  for ((i = 0; i < ${#av[@]}; i++)); do
+    a="${av[$i]}"
+    case "$a" in
+      -e|--endpoint|-t|--token) i=$((i + 1)) ;;
+      -i|--interval)            INTERVAL="${av[$((i + 1))]:-1.0}"; i=$((i + 1)) ;;
+      --info-report-interval)   INFO_INTERVAL="${av[$((i + 1))]:-5}"; i=$((i + 1)) ;;
+      --include-nics)           INCLUDE_NICS="${av[$((i + 1))]:-}"; i=$((i + 1)) ;;
+      --exclude-nics)           EXCLUDE_NICS="${av[$((i + 1))]:-}"; i=$((i + 1)) ;;
+      --include-mountpoint)     MOUNT_POINTS="${av[$((i + 1))]:-}"; i=$((i + 1)) ;;
+      --month-rotate)           MONTH_ROTATE="${av[$((i + 1))]:-0}"; i=$((i + 1)) ;;
+      --disable-web-ssh)        DISABLE_WEBSSH=1 ;;
+      --disable-auto-update)    DISABLE_AUTOUPDATE=1 ;;
+      -u|--ignore-unsafe-cert)  INSECURE=1 ;;
+      --gpu)                    GPU_MONITOR=1 ;;
+      --memory-mode-available)  MEM_AVAILABLE=1 ;;
+      *) EXTRA_AGENT="${EXTRA_AGENT:+$EXTRA_AGENT }$a" ;;
+    esac
+  done
+}
+
+cmd_edit_params() {
+  local idx="$1"
+  local n="${D_NAME[$idx]}" dir="${D_DIR[$idx]}"
+  local k="${D_KIND[$idx]}" ep="${D_EP[$idx]:-}" tk="${D_TK[$idx]:-}"
+  if [ -z "$tk" ]; then
+    warn "解析不到 $n 的 token，无法修改参数"
+    return 1
+  fi
+  if [ -z "$ep" ]; then
+    warn "解析不到 $n 的面板地址，无法修改参数"
+    return 1
+  fi
+
+  load_settings_from_args "${D_ARGS[$idx]:-}"
+  ENDPOINT="$ep"
+
+  ADV_MORE_DRAW="inst_draw2"
+  ADV_MORE_EDIT="inst_edit2"
+  ADV_MORE_N=6
+  if [ "$UI_TUI" -eq 1 ]; then
+    adv_run "修改参数" "$n · Esc 取消" adv_draw1 adv_edit1 8
+  else
+    step_advanced_plain
+  fi
+  ADV_MORE_DRAW="adv_draw2"
+  ADV_MORE_EDIT="adv_edit2"
+  ADV_MORE_N=8
+
+  build_args
+  blank
+  panel_row "服务" "$n"
+  panel_row "目录" "$dir"
+  dim "新参数: ${ARGS[*]}"
+  blank
+  local go
+  ask "应用并重启服务? (y/N)" "N" go
+  case "$go" in [Yy]*) ;; *) warn "已取消"; return 0 ;; esac
+
+  fetch_installer || die "下载安装脚本失败"
+  info "停止 $n"
+  svc_ctl stop "$n" "$k" || true
+  if bash "$KA_TMP" "${ARGS[@]}" \
+       --install-dir "$dir" --install-service-name "$n" -t "$tk" </dev/null; then
+    enable_start "$n" "$k"
+    ok "$n 参数已更新并重启"
+  else
+    err "更新失败，尝试恢复"
+    svc_ctl start "$n" "$k" || true
+    return 1
+  fi
 }
 
 cmd_cleanup() {
