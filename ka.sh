@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.0.4        归档文件: ka-v<版本>.sh
+#  版本: 0.0.5        归档文件: ka-v<版本>.sh
 #  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
@@ -22,7 +22,7 @@
 
 set -u
 
-KA_VERSION="0.0.4"
+KA_VERSION="0.0.5"
 KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
@@ -403,6 +403,8 @@ INSTALL_VERSION=""
 GH_PROXY=""
 INSTANCE_COUNT=1
 MULTI=0
+FORCE_SUFFIX=0
+NAME_START=1
 CANCELED=0
 TOKENS=()
 ARGS=()
@@ -547,10 +549,22 @@ init_label() {
 }
 
 inst_dir() {
-  if [ "$INSTANCE_COUNT" -eq 1 ]; then printf '%s' "$BASE_DIR"; else printf '%s/nat%s' "$BASE_DIR" "$1"; fi
+  if [ "$FORCE_SUFFIX" -eq 1 ]; then
+    printf '%s/nat%s' "$BASE_DIR" "$((NAME_START + $1 - 1))"
+  elif [ "$INSTANCE_COUNT" -eq 1 ]; then
+    printf '%s' "$BASE_DIR"
+  else
+    printf '%s/nat%s' "$BASE_DIR" "$1"
+  fi
 }
 inst_svc() {
-  if [ "$INSTANCE_COUNT" -eq 1 ]; then printf '%s' "$SVC_PREFIX"; else printf '%s-%s' "$SVC_PREFIX" "$1"; fi
+  if [ "$FORCE_SUFFIX" -eq 1 ]; then
+    printf '%s-%s' "$SVC_PREFIX" "$((NAME_START + $1 - 1))"
+  elif [ "$INSTANCE_COUNT" -eq 1 ]; then
+    printf '%s' "$SVC_PREFIX"
+  else
+    printf '%s-%s' "$SVC_PREFIX" "$1"
+  fi
 }
 
 build_args() {
@@ -979,8 +993,32 @@ step_tokens() {
   MULTI=0
   if [ "$INSTANCE_COUNT" -gt 1 ]; then MULTI=1; fi
 
+  # 机器上已有实例：新节点从下一个空闲编号开始，绝不覆盖老实例
+  FORCE_SUFFIX=0
+  NAME_START=1
+  if [ "$D_COUNT" -gt 0 ]; then
+    FORCE_SUFFIX=1
+    local n=1
+    while service_name_taken "${SVC_PREFIX}-${n}"; do n=$((n + 1)); done
+    NAME_START="$n"
+  fi
+
+  # 同一 token 只能对应一个节点，重复会互相顶掉
+  local i k
+  for ((i = 0; i < INSTANCE_COUNT; i++)); do
+    for ((k = 0; k < D_COUNT; k++)); do
+      if [ -n "${D_TK[$k]:-}" ] && [ "${D_TK[$k]}" = "${TOKENS[$i]}" ]; then
+        warn "token 与已有实例 ${D_NAME[$k]} 相同，会抢同一个节点"
+      fi
+    done
+  done
+
   blank
-  if [ "$MULTI" -eq 1 ]; then
+  if [ "$FORCE_SUFFIX" -eq 1 ] && [ "$INSTANCE_COUNT" -eq 1 ]; then
+    ok "共 1 个节点 → ${SVC_PREFIX}-${NAME_START}（不动已有的 ${SVC_PREFIX}）"
+  elif [ "$FORCE_SUFFIX" -eq 1 ]; then
+    ok "共 ${INSTANCE_COUNT} 个节点 → ${SVC_PREFIX}-${NAME_START} … ${SVC_PREFIX}-$((NAME_START + INSTANCE_COUNT - 1))"
+  elif [ "$MULTI" -eq 1 ]; then
     ok "共 ${INSTANCE_COUNT} 个节点 → ${SVC_PREFIX}-1 … ${SVC_PREFIX}-${INSTANCE_COUNT}"
   else
     ok "共 1 个节点 → 单实例 ${SVC_PREFIX}"
@@ -1233,6 +1271,14 @@ cmd_wizard() {
   discover_instances
   detect_init >/dev/null
 
+  # 已有实例的面板地址直接沿用，避免让人重新敲一遍
+  local k
+  if [ -z "$ENDPOINT" ]; then
+    for ((k = 0; k < D_COUNT; k++)); do
+      if [ -n "${D_EP[$k]}" ]; then ENDPOINT="${D_EP[$k]}"; break; fi
+    done
+  fi
+
   if [ "$UI_TUI" -eq 1 ]; then screen_home; fi
   banner
 
@@ -1240,12 +1286,16 @@ cmd_wizard() {
     panel_row "已有实例" "$D_COUNT 个（$(init_label "$INIT_SYS")）"
     local j
     for ((j = 0; j < D_COUNT; j++)); do
-      printf '  %s%s%s %s%s%s %s%s%s\n' \
+      printf '  %s%s%s %s%s%s  %s%s%s  %s%s%s\n' \
         "$PURP" "$G_BAR" "$RESET" "$WHITE" "${D_NAME[$j]}" "$RESET" \
-        "$GRAY" "${D_DIR[$j]}" "$RESET"
+        "$GRAY" "${D_DIR[$j]}" "$RESET" \
+        "$GRAY" "${D_EP[$j]:-—}" "$RESET"
     done
     blank
     warn "新增实例不会改动它们；但若服务名相同会被覆盖"
+    if [ -n "$ENDPOINT" ]; then
+      dim "面板地址将沿用：$ENDPOINT（下一步直接回车即可）"
+    fi
     local go
     ask "继续新增实例? (y/N)" "N" go
     case "$go" in
