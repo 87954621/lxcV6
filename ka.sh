@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.0.2        归档文件: ka-v<版本>.sh
+#  版本: 0.0.4        归档文件: ka-v<版本>.sh
 #  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
@@ -22,7 +22,7 @@
 
 set -u
 
-KA_VERSION="0.0.2"
+KA_VERSION="0.0.4"
 KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
@@ -212,6 +212,7 @@ tui_init() {
 
 tui_restore() {
   if [ "${UI_TUI:-0}" -eq 1 ]; then printf '%s' $'\033[?25h'; fi
+  if [ -n "${KA_TMP:-}" ] && [ -f "$KA_TMP" ]; then rm -f "$KA_TMP"; fi
 }
 trap 'tui_restore' EXIT
 trap 'tui_restore; exit 130' INT TERM
@@ -250,32 +251,60 @@ read_key() {
 }
 
 draw_header() {
-  local title="$1" sub="${2:-}"
+  local title="$1" sub="${2:-}" line
   printf '  %s\n' "$(rainbow 'K O M A R I   A G E N T')"
   printf '  %s%s%s\n' "$GRAY" "$(repeat "$G_RULE" 40)" "$RESET"
   printf '  %s%s%s  %s%s%s\n' "$PINK" "$G_BAR" "$RESET" "$B" "$title" "$RESET"
-  if [ -n "$sub" ]; then printf '\n  %s%s%s\n' "$GRAY" "$sub" "$RESET"; fi
+  if [ -n "$sub" ]; then
+    printf '\n'
+    while IFS= read -r line; do
+      printf '  %s%s%s\n' "$GRAY" "$line" "$RESET"
+    done <<< "$sub"
+  fi
   printf '\n'
 }
+
+is_sep() { [ "${1:-}" = "──" ]; }
 
 pick() {
   local title="$1" sub="$2"
   shift 2
   local -a items=("$@")
-  local n="${#items[@]}" sel="${PICK_START:-0}" i v
-  PICK_START=0
+  local n="${#items[@]}" i v
   if [ "$n" -eq 0 ]; then return 1; fi
-  if [ "$sel" -ge "$n" ]; then sel=0; fi
+
+  local -a av=()
+  for ((i = 0; i < n; i++)); do
+    if ! is_sep "${items[$i]}"; then av+=("$i"); fi
+  done
+  local m="${#av[@]}"
+  if [ "$m" -eq 0 ]; then return 1; fi
+
+  local sel="${av[0]}" pos=0
+  if [ "${PICK_START:-0}" -ge 0 ] && [ "${PICK_START:-0}" -lt "$n" ] \
+     && ! is_sep "${items[${PICK_START:-0}]}"; then
+    sel="${PICK_START:-0}"
+  fi
+  PICK_START=0
+  for ((i = 0; i < m; i++)); do
+    if [ "${av[$i]}" -eq "$sel" ]; then pos="$i"; fi
+  done
 
   if [ "$UI_TUI" -eq 0 ]; then
     printf '\n  %s%s%s  %s\n\n' "$PINK" "$G_BAR" "$RESET" "$title"
     if [ -n "$sub" ]; then printf '  %s%s%s\n\n' "$GRAY" "$sub" "$RESET"; fi
+    local idx=0
     for ((i = 0; i < n; i++)); do
-      printf '   %s%s%d%s  %s\n' "$CYAN" "$B" "$((i + 1))" "$RESET" "${items[$i]}"
+      if is_sep "${items[$i]}"; then
+        printf '   %s──────%s\n' "$DIM" "$RESET"
+      else
+        idx=$((idx + 1))
+        printf '   %s%s%d%s  %s\n' "$CYAN" "$B" "$idx" "$RESET" "${items[$i]}"
+      fi
     done
     printf '\n'
-    ask_int "选择" "1" v 1 "$n"
-    PICK_RESULT=$((v - 1))
+    ask_int "选择" "$((pos + 1))" v 1 "$m"
+    PICK_RESULT="${av[$((v - 1))]}"
     return 0
   fi
 
@@ -284,22 +313,24 @@ pick() {
     screen_home
     draw_header "$title" "$sub"
     for ((i = 0; i < n; i++)); do
-      if [ "$i" -eq "$sel" ]; then
+      if is_sep "${items[$i]}"; then
+        printf '   %s──────%s\n' "$DIM" "$RESET"
+      elif [ "$i" -eq "$sel" ]; then
         printf '   %s❯%s %s%s%s\n' "$PINK" "$RESET" "$B" "${items[$i]}" "$RESET"
       else
         printf '     %s\n' "${items[$i]}"
       fi
     done
-    printf '\n   %s↑↓ 移动 · Enter 选择 · q 退出%s\n' "$GRAY" "$RESET"
+    printf '\n   %s↑↓ 移动 · Enter 选择 · q 返回%s\n' "$GRAY" "$RESET"
     if ! read_key; then show_cursor; return 1; fi
     case "$KEY" in
-      UP)   sel=$(((sel + n - 1) % n)) ;;
-      DOWN) sel=$(((sel + 1) % n)) ;;
+      UP)   pos=$(((pos + m - 1) % m)); sel="${av[$pos]}" ;;
+      DOWN) pos=$(((pos + 1) % m)); sel="${av[$pos]}" ;;
       ENTER|SPACE) break ;;
       QUIT|ESC) show_cursor; return 2 ;;
       [0-9])
         v=$((KEY - 1))
-        if [ "$v" -ge 0 ] && [ "$v" -lt "$n" ]; then sel="$v"; fi ;;
+        if [ "$v" -ge 0 ] && [ "$v" -lt "$m" ]; then pos="$v"; sel="${av[$pos]}"; fi ;;
     esac
   done
   show_cursor
@@ -342,11 +373,13 @@ edit_int() {
 }
 
 edit_str() {
-  local label="$1" var="$2"
+  local label="$1" var="$2" v
   show_cursor
   screen_home
-  draw_header "高级参数" "修改后回车确认（留空 = 清空）"
-  ask "$label" "${!var}" "$var"
+  draw_header "修改" "回车保留，输入 - 清空"
+  ask "$label" "${!var}" v
+  if [ "$v" = "-" ]; then v=""; fi
+  printf -v "$var" '%s' "$v"
   hide_cursor
 }
 
@@ -362,11 +395,18 @@ MEM_AVAILABLE=0
 INSECURE=0
 INCLUDE_NICS=""
 EXCLUDE_NICS=""
+MOUNT_POINTS=""
+MONTH_ROTATE="0"
+GPU_MONITOR=0
+EXTRA_AGENT=""
+INSTALL_VERSION=""
+GH_PROXY=""
 INSTANCE_COUNT=1
 MULTI=0
 CANCELED=0
 TOKENS=()
 ARGS=()
+IARGS=()
 
 load_conf() {
   [ -f "$KA_CONF" ] || return 0
@@ -383,6 +423,12 @@ load_conf() {
   INSECURE="${KA_INSECURE:-$INSECURE}"
   INCLUDE_NICS="${KA_INCLUDE_NICS:-$INCLUDE_NICS}"
   EXCLUDE_NICS="${KA_EXCLUDE_NICS:-$EXCLUDE_NICS}"
+  MOUNT_POINTS="${KA_MOUNT_POINTS:-$MOUNT_POINTS}"
+  MONTH_ROTATE="${KA_MONTH_ROTATE:-$MONTH_ROTATE}"
+  GPU_MONITOR="${KA_GPU:-$GPU_MONITOR}"
+  EXTRA_AGENT="${KA_EXTRA:-$EXTRA_AGENT}"
+  INSTALL_VERSION="${KA_INSTALL_VERSION:-$INSTALL_VERSION}"
+  GH_PROXY="${KA_GH_PROXY:-$GH_PROXY}"
   INSTANCE_COUNT="${KA_INSTANCE_COUNT:-$INSTANCE_COUNT}"
 }
 
@@ -404,6 +450,12 @@ KA_MEMAVAIL='$MEM_AVAILABLE'
 KA_INSECURE='$INSECURE'
 KA_INCLUDE_NICS='$INCLUDE_NICS'
 KA_EXCLUDE_NICS='$EXCLUDE_NICS'
+KA_MOUNT_POINTS='$MOUNT_POINTS'
+KA_MONTH_ROTATE='$MONTH_ROTATE'
+KA_GPU='$GPU_MONITOR'
+KA_EXTRA='$EXTRA_AGENT'
+KA_INSTALL_VERSION='$INSTALL_VERSION'
+KA_GH_PROXY='$GH_PROXY'
 KA_INSTANCE_COUNT='$INSTANCE_COUNT'
 EOF
   ) 2>/dev/null || true
@@ -507,8 +559,22 @@ build_args() {
   [ "$DISABLE_AUTOUPDATE" -eq 1 ] && ARGS+=(--disable-auto-update)
   [ "$MEM_AVAILABLE" -eq 1 ]      && ARGS+=(--memory-mode-available)
   [ "$INSECURE" -eq 1 ]           && ARGS+=(-u)
+  [ "$GPU_MONITOR" -eq 1 ]        && ARGS+=(--gpu)
   [ -n "$INCLUDE_NICS" ]          && ARGS+=(--include-nics "$INCLUDE_NICS")
   [ -n "$EXCLUDE_NICS" ]          && ARGS+=(--exclude-nics "$EXCLUDE_NICS")
+  [ -n "$MOUNT_POINTS" ]          && ARGS+=(--include-mountpoint "$MOUNT_POINTS")
+  [ "$MONTH_ROTATE" != "0" ]      && ARGS+=(--month-rotate "$MONTH_ROTATE")
+  if [ -n "$EXTRA_AGENT" ]; then
+    # shellcheck disable=SC2206
+    ARGS+=($EXTRA_AGENT)
+  fi
+  return 0
+}
+
+install_args() {
+  IARGS=()
+  [ -n "$INSTALL_VERSION" ] && IARGS+=(--install-version "$INSTALL_VERSION")
+  [ -n "$GH_PROXY" ]        && IARGS+=(--install-ghproxy "$GH_PROXY")
   return 0
 }
 
@@ -572,12 +638,26 @@ svc_logs() { # 名字 类型 行数
   esac
 }
 
+svc_enabled() { # 名字 类型
+  local n="$1" k="$2"
+  case "$k" in
+    systemd) systemctl is-enabled "$n" 2>/dev/null || true ;;
+    openrc)
+      if rc-update show default 2>/dev/null | awk '{print $1}' | grep -qx "$n"; then
+        printf 'enabled'
+      else
+        printf 'disabled'
+      fi ;;
+    *) printf '—' ;;
+  esac
+}
+
 # ============================================================ 已有实例扫描 ===
 D_COUNT=0
-D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
+D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=(); D_ARGS=()
 
-add_instance() { # 名字 类型 可执行文件 面板 token
-  local name="$1" kind="$2" exe="$3" ep="$4" tk="$5"
+add_instance() { # 名字 类型 可执行文件 面板 token 原始参数
+  local name="$1" kind="$2" exe="$3" ep="$4" tk="$5" raw="${6:-}"
   local dir tag
   dir="$(dirname "$exe")"
   tag="外部"
@@ -588,13 +668,13 @@ add_instance() { # 名字 类型 可执行文件 面板 token
     "$BASE_DIR"|"${BASE_DIR%/}"/*|/opt/komari|/opt/komari/*) tag="受管" ;;
   esac
   D_NAME+=("$name"); D_KIND+=("$kind"); D_EXE+=("$exe"); D_DIR+=("$dir")
-  D_EP+=("$ep"); D_TK+=("$tk"); D_TAG+=("$tag")
+  D_EP+=("$ep"); D_TK+=("$tk"); D_TAG+=("$tag"); D_ARGS+=("$raw")
   D_COUNT=$((D_COUNT + 1))
 }
 
 discover_systemd() {
   local -a units=()
-  local hit unit line exe
+  local hit unit line exe raw
   while IFS= read -r hit; do
     [ -n "$hit" ] && units+=("$(basename "$hit" .service)")
   done <<< "$(grep -lis 'komari-agent' \
@@ -616,7 +696,9 @@ discover_systemd() {
     exe="${exe#-}"; exe="${exe%\"}"; exe="${exe#\"}"
     case "$exe" in *komari*) ;; *) continue ;; esac
     parse_args "$line"
-    add_instance "$unit" systemd "$exe" "$EP" "$TK"
+    raw="${line#* }"
+    [ "$raw" = "$line" ] && raw=""
+    add_instance "$unit" systemd "$exe" "$EP" "$TK" "$raw"
   done <<< "$sorted"
 }
 
@@ -637,7 +719,7 @@ discover_openrc() {
     fi
     if [ -z "$exe" ]; then continue; fi
     parse_args "$args"
-    add_instance "$name" openrc "$exe" "$EP" "$TK"
+    add_instance "$name" openrc "$exe" "$EP" "$TK" "$args"
   done
 }
 
@@ -669,24 +751,25 @@ discover_procs() {
       if [ "${D_EXE[$i]}" = "$exe" ]; then covered=$((i + 1)); break; fi
     done
     if [ "$covered" -gt 0 ]; then
-      # 服务已登记，用真实命令行补全缺失的面板地址 / token
+      # 服务已登记，用真实命令行补全缺失的面板地址 / token / 参数
       local j=$((covered - 1))
       if [ -z "${D_EP[$j]}" ] && [ -n "$EP" ]; then D_EP[$j]="$EP"; fi
       if [ -z "${D_TK[$j]}" ] && [ -n "$TK" ]; then D_TK[$j]="$TK"; fi
+      if [ -z "${D_ARGS[$j]}" ] && [ -n "$cmd" ]; then D_ARGS[$j]="${cmd#* }"; fi
       continue
     fi
     local svc
     if svc="$(init_for_exe "$exe")"; then
-      add_instance "$svc" openrc "$exe" "$EP" "$TK"
+      add_instance "$svc" openrc "$exe" "$EP" "$TK" "${cmd#* }"
     else
-      add_instance "pid-$pid" proc "$exe" "$EP" "$TK"
+      add_instance "pid-$pid" proc "$exe" "$EP" "$TK" "${cmd#* }"
     fi
   done
 }
 
 discover_instances() {
   D_COUNT=0
-  D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=()
+  D_NAME=(); D_KIND=(); D_EXE=(); D_DIR=(); D_EP=(); D_TK=(); D_TAG=(); D_ARGS=()
   detect_init >/dev/null
   case "$INIT_SYS" in
     systemd) discover_systemd ;;
@@ -701,6 +784,97 @@ count_managed() {
     if [ "${D_TAG[$i]}" = "受管" ]; then n=$((n + 1)); fi
   done
   printf '%s' "$n"
+}
+
+# ---------------------------------------------------------------- 元数据 ---
+META_FILE="${KA_META:-/etc/ka-meta.tsv}"
+
+meta_get() {
+  [ -f "$META_FILE" ] || return 0
+  awk -F "$(printf '\t')" -v k="$1" '$1 == k { print $2; exit }' "$META_FILE" 2>/dev/null
+}
+
+meta_set() {
+  local name="$1" note="$2" tmp
+  mkdir -p "$(dirname "$META_FILE")" 2>/dev/null || true
+  tmp="${META_FILE}.tmp.$$"
+  : > "$tmp" 2>/dev/null || { warn "无法写入 $META_FILE"; return 1; }
+  if [ -f "$META_FILE" ]; then
+    awk -F "$(printf '\t')" -v k="$name" '$1 != k' "$META_FILE" >> "$tmp" 2>/dev/null
+  fi
+  if [ -n "$note" ]; then
+    printf '%s\t%s\n' "$name" "$note" >> "$tmp"
+  fi
+  if mv -f "$tmp" "$META_FILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "写入 $META_FILE 失败"
+  return 1
+}
+
+find_idx() {
+  local name="$1" i
+  for ((i = 0; i < D_COUNT; i++)); do
+    if [ "${D_NAME[$i]}" = "$name" ]; then printf '%s' "$i"; return 0; fi
+  done
+  return 1
+}
+
+# ------------------------------------------------ 安装器 / 服务操作工具 ---
+KA_TMP=""
+fetch_installer() {
+  [ -n "$KA_TMP" ] && [ -s "$KA_TMP" ] && return 0
+  need_curl
+  KA_TMP="$(mktemp /tmp/ka-install.XXXXXX)" || return 1
+  if ! curl -fsSL --max-time 120 "$KA_INSTALLER" -o "$KA_TMP" || [ ! -s "$KA_TMP" ]; then
+    rm -f "$KA_TMP"
+    KA_TMP=""
+    return 1
+  fi
+}
+
+filter_args() { # 去掉 -e/-t 及其值，保留其余参数
+  local -a av=($1)
+  local i s=""
+  for ((i = 0; i < ${#av[@]}; i++)); do
+    case "${av[$i]}" in
+      -e|--endpoint|-t|--token) i=$((i + 1)); continue ;;
+      *) s+=" ${av[$i]}" ;;
+    esac
+  done
+  printf '%s' "${s# }"
+}
+
+reinstall_service() { # 目录 服务名 面板 token 额外参数
+  local dir="$1" name="$2" ep="$3" tk="$4" extra="${5:-}"
+  install_args
+  # shellcheck disable=SC2086
+  bash "$KA_TMP" -e "$ep" -t "$tk" "${IARGS[@]}" \
+    --install-dir "$dir" --install-service-name "$name" $extra </dev/null
+}
+
+enable_start() { # 名字 类型
+  local n="$1" k="$2"
+  case "$k" in
+    systemd) systemctl enable --now "$n" >/dev/null 2>&1 || true ;;
+    openrc)
+      rc-update add "$n" default >/dev/null 2>&1 || true
+      rc-service "$n" start >/dev/null 2>&1 || true ;;
+  esac
+}
+
+purge_service() { # 名字 类型：只删服务定义，不动目录
+  local n="$1" k="$2"
+  case "$k" in
+    systemd)
+      systemctl disable "$n" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/$n.service"
+      systemctl daemon-reload 2>/dev/null || true ;;
+    openrc)
+      rc-update del "$n" default >/dev/null 2>&1 || true
+      rm -f "/etc/init.d/$n" ;;
+  esac
 }
 
 remove_index() { # 下标 [force]
@@ -813,83 +987,128 @@ step_tokens() {
   fi
 }
 
-step_advanced() {
-  step_header 3 4 "高级参数"
-  if [ "$UI_TUI" -eq 0 ]; then
-    step_advanced_plain
-    return 0
-  fi
-  local sel=0 n=11
+adv_run() { # 标题 副标题 绘制函数 编辑函数 项数
+  local title="$1" sub="$2" draw="$3" edit="$4" n="$5"
+  local sel=0
   hide_cursor
   while :; do
     screen_home
-    draw_header "高级参数" "↑↓ 移动 · Enter 修改 · Esc 完成"
-    cfg_row 0 "$sel" "上报间隔"       "${YELL}${INTERVAL}${RESET} 秒"
-    cfg_row 1 "$sel" "基础信息间隔"   "${YELL}${INFO_INTERVAL}${RESET} 分钟"
-    cfg_row 2 "$sel" "禁用远程控制"   "$(toggle_render "$DISABLE_WEBSSH")"
-    cfg_row 3 "$sel" "禁用自动更新"   "$(toggle_render "$DISABLE_AUTOUPDATE")"
-    cfg_row 4 "$sel" "内存按可用计算" "$(toggle_render "$MEM_AVAILABLE")"
-    cfg_row 5 "$sel" "忽略不安全证书" "$(toggle_render "$INSECURE")"
-    cfg_row 6 "$sel" "包含网卡"       "${WHITE}${INCLUDE_NICS:-全部}${RESET}"
-    cfg_row 7 "$sel" "排除网卡"       "${WHITE}${EXCLUDE_NICS:-无}${RESET}"
-    cfg_row 8 "$sel" "安装根目录"     "${WHITE}${BASE_DIR}${RESET}"
-    cfg_row 9 "$sel" "服务名前缀"     "${WHITE}${SVC_PREFIX}${RESET}"
-    cfg_row 10 "$sel" "完成并继续"    "${GREEN}→${RESET}"
-    printf '\n   %s↑↓ 移动 · Enter 修改 · Esc 完成%s\n' "$GRAY" "$RESET"
+    draw_header "$title" "$sub"
+    "$draw" "$sel"
+    printf '\n   %s↑↓ 移动 · Enter 修改 · Esc 返回%s\n' "$GRAY" "$RESET"
     if ! read_key; then break; fi
     case "$KEY" in
       UP)   sel=$(((sel + n - 1) % n)) ;;
       DOWN) sel=$(((sel + 1) % n)) ;;
       ESC|QUIT) break ;;
       ENTER|SPACE)
-        case "$sel" in
-          0) edit_num "上报间隔（秒）" INTERVAL ;;
-          1) edit_int "基础信息间隔（分钟）" INFO_INTERVAL 1 60 ;;
-          2) [ "$DISABLE_WEBSSH" -eq 1 ] && DISABLE_WEBSSH=0 || DISABLE_WEBSSH=1 ;;
-          3) [ "$DISABLE_AUTOUPDATE" -eq 1 ] && DISABLE_AUTOUPDATE=0 || DISABLE_AUTOUPDATE=1 ;;
-          4) [ "$MEM_AVAILABLE" -eq 1 ] && MEM_AVAILABLE=0 || MEM_AVAILABLE=1 ;;
-          5) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
-          6) edit_str "包含网卡（逗号分隔，空=全部）" INCLUDE_NICS ;;
-          7) edit_str "排除网卡（逗号分隔，空=不排除）" EXCLUDE_NICS ;;
-          8) edit_str "安装根目录" BASE_DIR ;;
-          9) edit_str "服务名前缀" SVC_PREFIX ;;
-          10) break ;;
-        esac ;;
+        if ! "$edit" "$sel"; then break; fi ;;
     esac
   done
   show_cursor
   blank
 }
 
+adv_draw1() {
+  local s="$1"
+  cfg_row 0 "$s" "采集间隔"       "${YELL}${INTERVAL}${RESET} 秒"
+  cfg_row 1 "$s" "信息上报间隔"   "${YELL}${INFO_INTERVAL}${RESET} 分钟"
+  cfg_row 2 "$s" "禁用远程控制"   "$(toggle_render "$DISABLE_WEBSSH")"
+  cfg_row 3 "$s" "禁用自动更新"   "$(toggle_render "$DISABLE_AUTOUPDATE")"
+  cfg_row 4 "$s" "忽略不安全证书" "$(toggle_render "$INSECURE")"
+  cfg_row 5 "$s" "详细 GPU 监控"  "$(toggle_render "$GPU_MONITOR")"
+  cfg_row 6 "$s" "更多设置"       "${GRAY}网络 / 磁盘 / 安装 →${RESET}"
+  cfg_row 7 "$s" "完成并继续"     "${GREEN}→${RESET}"
+}
+
+adv_edit1() {
+  case "$1" in
+    0) edit_num "采集间隔（秒）" INTERVAL ;;
+    1) edit_int "信息上报间隔（分钟）" INFO_INTERVAL 1 60 ;;
+    2) [ "$DISABLE_WEBSSH" -eq 1 ] && DISABLE_WEBSSH=0 || DISABLE_WEBSSH=1 ;;
+    3) [ "$DISABLE_AUTOUPDATE" -eq 1 ] && DISABLE_AUTOUPDATE=0 || DISABLE_AUTOUPDATE=1 ;;
+    4) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
+    5) [ "$GPU_MONITOR" -eq 1 ] && GPU_MONITOR=0 || GPU_MONITOR=1 ;;
+    6) adv_run "更多设置" "网卡 / 挂载点 / 安装项" adv_draw2 adv_edit2 8 ;;
+    7) return 1 ;;
+  esac
+  return 0
+}
+
+adv_draw2() {
+  local s="$1"
+  cfg_row 0 "$s" "包含网卡"     "${WHITE}${INCLUDE_NICS:-全部}${RESET}"
+  cfg_row 1 "$s" "排除网卡"     "${WHITE}${EXCLUDE_NICS:-无}${RESET}"
+  cfg_row 2 "$s" "包含挂载点"   "${WHITE}${MOUNT_POINTS:-全部}${RESET}"
+  cfg_row 3 "$s" "月重置日"     "${YELL}${MONTH_ROTATE}${RESET}（0=关闭）"
+  cfg_row 4 "$s" "安装版本"     "${WHITE}${INSTALL_VERSION:-latest}${RESET}"
+  cfg_row 5 "$s" "GitHub 代理"  "${WHITE}${GH_PROXY:-直连}${RESET}"
+  cfg_row 6 "$s" "额外参数"     "${WHITE}${EXTRA_AGENT:-无}${RESET}"
+  cfg_row 7 "$s" "返回"         "${GREEN}←${RESET}"
+}
+
+adv_edit2() {
+  case "$1" in
+    0) edit_str "包含网卡（逗号分隔，空=全部）" INCLUDE_NICS ;;
+    1) edit_str "排除网卡（逗号分隔，空=不排除）" EXCLUDE_NICS ;;
+    2) edit_str "包含挂载点（分号分隔，空=全部）" MOUNT_POINTS ;;
+    3) edit_int "月重置日（1-31，0=关闭）" MONTH_ROTATE 0 31 ;;
+    4) edit_str "安装版本（如 1.2.13 / snapshot，空=latest）" INSTALL_VERSION ;;
+    5) edit_str "GitHub 代理（如 https://ghproxy.net，空=直连）" GH_PROXY ;;
+    6) edit_str "额外参数（原样传给 agent，空=无）" EXTRA_AGENT ;;
+    7) return 1 ;;
+  esac
+  return 0
+}
+
+step_advanced() {
+  step_header 3 4 "高级参数"
+  if [ "$UI_TUI" -eq 0 ]; then
+    step_advanced_plain
+    return 0
+  fi
+  adv_run "高级参数" "默认值够用，Esc 或「完成」继续" adv_draw1 adv_edit1 8
+}
+
 step_advanced_plain() {
-  local ch
-  dim "输入编号修改，直接回车进入下一步"
+  local ch v
+  dim "输入编号修改，直接回车继续（输入 - 清空该项）"
   blank
-  printf '   %s1%s  上报间隔        %s 秒\n' "$CYAN" "$RESET" "$INTERVAL"
-  printf '   %s2%s  基础信息间隔    %s 分钟\n' "$CYAN" "$RESET" "$INFO_INTERVAL"
-  printf '   %s3%s  禁用远程控制    %s\n' "$CYAN" "$RESET" "$(toggle_render "$DISABLE_WEBSSH")"
-  printf '   %s4%s  禁用自动更新    %s\n' "$CYAN" "$RESET" "$(toggle_render "$DISABLE_AUTOUPDATE")"
-  printf '   %s5%s  内存按可用计算  %s\n' "$CYAN" "$RESET" "$(toggle_render "$MEM_AVAILABLE")"
-  printf '   %s6%s  忽略不安全证书  %s\n' "$CYAN" "$RESET" "$(toggle_render "$INSECURE")"
-  printf '   %s7%s  包含网卡        %s\n' "$CYAN" "$RESET" "${INCLUDE_NICS:-全部}"
-  printf '   %s8%s  排除网卡        %s\n' "$CYAN" "$RESET" "${EXCLUDE_NICS:-无}"
-  printf '   %s9%s  安装根目录      %s\n' "$CYAN" "$RESET" "$BASE_DIR"
-  printf '   %s10%s 服务名前缀      %s\n' "$CYAN" "$RESET" "$SVC_PREFIX"
+  printf '   %s1%s   采集间隔        %s 秒\n' "$CYAN" "$RESET" "$INTERVAL"
+  printf '   %s2%s   信息上报间隔    %s 分钟\n' "$CYAN" "$RESET" "$INFO_INTERVAL"
+  printf '   %s3%s   禁用远程控制    %s\n' "$CYAN" "$RESET" "$(toggle_render "$DISABLE_WEBSSH")"
+  printf '   %s4%s   禁用自动更新    %s\n' "$CYAN" "$RESET" "$(toggle_render "$DISABLE_AUTOUPDATE")"
+  printf '   %s5%s   忽略不安全证书  %s\n' "$CYAN" "$RESET" "$(toggle_render "$INSECURE")"
+  printf '   %s6%s   详细 GPU 监控   %s\n' "$CYAN" "$RESET" "$(toggle_render "$GPU_MONITOR")"
+  printf '   %s7%s   包含网卡        %s\n' "$CYAN" "$RESET" "${INCLUDE_NICS:-全部}"
+  printf '   %s8%s   排除网卡        %s\n' "$CYAN" "$RESET" "${EXCLUDE_NICS:-无}"
+  printf '   %s9%s   包含挂载点      %s\n' "$CYAN" "$RESET" "${MOUNT_POINTS:-全部}"
+  printf '   %s10%s  月重置日        %s\n' "$CYAN" "$RESET" "$MONTH_ROTATE"
+  printf '   %s11%s  安装版本        %s\n' "$CYAN" "$RESET" "${INSTALL_VERSION:-latest}"
+  printf '   %s12%s  GitHub 代理     %s\n' "$CYAN" "$RESET" "${GH_PROXY:-直连}"
+  printf '   %s13%s  安装目录        %s\n' "$CYAN" "$RESET" "$BASE_DIR"
+  printf '   %s14%s  服务名前缀      %s\n' "$CYAN" "$RESET" "$SVC_PREFIX"
+  printf '   %s15%s  额外参数        %s\n' "$CYAN" "$RESET" "${EXTRA_AGENT:-无}"
   blank
   while :; do
     ask "编号（回车继续）" "" ch
     case "$ch" in
       '') return 0 ;;
-      1) ask_num "上报间隔（秒）" "$INTERVAL" INTERVAL ;;
-      2) ask_int "基础信息间隔（分钟）" "$INFO_INTERVAL" INFO_INTERVAL 1 60 ;;
+      1) ask_num "采集间隔（秒）" "$INTERVAL" INTERVAL ;;
+      2) ask_int "信息上报间隔（分钟）" "$INFO_INTERVAL" INFO_INTERVAL 1 60 ;;
       3) [ "$DISABLE_WEBSSH" -eq 1 ] && DISABLE_WEBSSH=0 || DISABLE_WEBSSH=1 ;;
       4) [ "$DISABLE_AUTOUPDATE" -eq 1 ] && DISABLE_AUTOUPDATE=0 || DISABLE_AUTOUPDATE=1 ;;
-      5) [ "$MEM_AVAILABLE" -eq 1 ] && MEM_AVAILABLE=0 || MEM_AVAILABLE=1 ;;
-      6) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
-      7) ask "包含网卡（逗号分隔，空=全部）" "$INCLUDE_NICS" INCLUDE_NICS ;;
-      8) ask "排除网卡（逗号分隔，空=不排除）" "$EXCLUDE_NICS" EXCLUDE_NICS ;;
-      9) ask "安装根目录" "$BASE_DIR" BASE_DIR ;;
-      10) ask "服务名前缀" "$SVC_PREFIX" SVC_PREFIX ;;
+      5) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
+      6) [ "$GPU_MONITOR" -eq 1 ] && GPU_MONITOR=0 || GPU_MONITOR=1 ;;
+      7) ask "包含网卡" "$INCLUDE_NICS" v; [ "$v" = "-" ] && v=""; INCLUDE_NICS="$v" ;;
+      8) ask "排除网卡" "$EXCLUDE_NICS" v; [ "$v" = "-" ] && v=""; EXCLUDE_NICS="$v" ;;
+      9) ask "包含挂载点" "$MOUNT_POINTS" v; [ "$v" = "-" ] && v=""; MOUNT_POINTS="$v" ;;
+      10) ask_int "月重置日（0-31）" "$MONTH_ROTATE" MONTH_ROTATE 0 31 ;;
+      11) ask "安装版本（空=latest）" "$INSTALL_VERSION" v; [ "$v" = "-" ] && v=""; INSTALL_VERSION="$v" ;;
+      12) ask "GitHub 代理" "$GH_PROXY" v; [ "$v" = "-" ] && v=""; GH_PROXY="$v" ;;
+      13) ask "安装目录" "$BASE_DIR" BASE_DIR ;;
+      14) ask "服务名前缀" "$SVC_PREFIX" SVC_PREFIX ;;
+      15) ask "额外参数" "$EXTRA_AGENT" v; [ "$v" = "-" ] && v=""; EXTRA_AGENT="$v" ;;
       *) warn "没有 $ch 这个编号" ;;
     esac
     ok "已更新"
@@ -950,6 +1169,7 @@ do_install() {
   need_root; need_curl
   save_conf
   build_args
+  install_args
   local tmp i token dir svc fails=0
   tmp="$(mktemp /tmp/ka-install.XXXXXX)" || die "无法创建临时文件"
   info "下载安装脚本…"
@@ -970,7 +1190,7 @@ do_install() {
       systemd) systemctl stop "$svc" >/dev/null 2>&1 || true ;;
       openrc)  rc-service "$svc" stop >/dev/null 2>&1 || true ;;
     esac
-    if bash "$tmp" "${ARGS[@]}" \
+    if bash "$tmp" "${ARGS[@]}" "${IARGS[@]}" \
          -t "$token" --install-dir "$dir" --install-service-name "$svc" </dev/null; then
       case "$INIT_SYS" in
         systemd) systemctl enable --now "$svc" >/dev/null 2>&1 || true ;;
@@ -1056,7 +1276,7 @@ cmd_status() {
   printf '\n  %s%s%s %s实例状态%s %s(%s 个 · %s)%s\n' \
     "$PURP" "$G_BAR" "$RESET" "$B" "$RESET" "$GRAY" "$D_COUNT" "$(init_label "$INIT_SYS")" "$RESET"
   rule 66
-  local i act col dot tag
+  local i act col dot tag note tail_txt
   for ((i = 0; i < D_COUNT; i++)); do
     act="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
     case "$act" in
@@ -1065,12 +1285,15 @@ cmd_status() {
       inactive) col="$GRAY";  dot="$G_DOT_OFF"; tag="已停止" ;;
       *)        col="$YELL";  dot="$G_DOT_OFF"; tag="$act" ;;
     esac
+    note="$(meta_get "${D_NAME[$i]}")"
+    tail_txt="${D_EP[$i]:-—}"
+    [ -n "$note" ] && tail_txt="$note · $tail_txt"
     printf '  %s%s%s %s%s%s  %s%s%s  %s%s%s  %s%s%s\n' \
       "$col" "$dot" "$RESET" \
       "$WHITE" "${D_NAME[$i]}" "$RESET" \
       "$CYAN" "${D_TAG[$i]}" "$RESET" \
       "$col" "$tag" "$RESET" \
-      "$GRAY" "${D_EP[$i]:-—}" "$RESET"
+      "$GRAY" "$tail_txt" "$RESET"
   done
   rule 66
   local conns="未知"
@@ -1091,14 +1314,18 @@ cmd_doctor() {
   fi
   printf '\n  %s%s%s %s自检%s\n' "$PURP" "$G_BAR" "$RESET" "$B" "$RESET"
   rule 60
-  local i act okc=0 code
+  local i act okc=0 code en
   for ((i = 0; i < D_COUNT; i++)); do
     act="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
+    en="$(svc_enabled "${D_NAME[$i]}" "${D_KIND[$i]}")"
     if [ "$act" = "active" ]; then
       printf '  %s%s%s %s  服务运行中\n' "$GREEN" "$G_OK" "$RESET" "${D_NAME[$i]}"
       okc=$((okc + 1))
     else
       printf '  %s%s%s %s  服务未运行（%s）\n' "$RED" "$G_ERR" "$RESET" "${D_NAME[$i]}" "$act"
+    fi
+    if [ "$en" = "disabled" ]; then
+      printf '  %s%s%s %s  未设置开机自启（重启后不会自动拉起）\n' "$YELL" "$G_WARN" "$RESET" "  "
     fi
     if [ -n "${D_EP[$i]}" ]; then
       code="$(curl -o /dev/null -sS -k -w '%{http_code}' --max-time 6 "${D_EP[$i]}" 2>/dev/null || printf '000')"
@@ -1113,57 +1340,333 @@ cmd_doctor() {
   printf '  %s%d/%d 个实例在运行%s\n\n' "$GRAY" "$okc" "$D_COUNT" "$RESET"
 }
 
+state_cn() {
+  case "$1" in
+    active)   printf '运行中' ;;
+    inactive) printf '已停止' ;;
+    failed)   printf '失败' ;;
+    '')       printf '未知' ;;
+    *)        printf '%s' "$1" ;;
+  esac
+}
+
 cmd_instances() {
   load_conf
-  discover_instances
-  if [ "$D_COUNT" -eq 0 ]; then
-    warn "没有发现已安装的 komari-agent"
-    return 0
-  fi
-  local -a items=()
-  local i st
-  for ((i = 0; i < D_COUNT; i++)); do
-    st="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
-    items+=("${D_NAME[$i]}  [${D_TAG[$i]}]  $st")
+  while :; do
+    discover_instances
+    if [ "$D_COUNT" -eq 0 ]; then
+      warn "没有发现已安装的 komari-agent"
+      return 0
+    fi
+    local -a items=()
+    local i st note line
+    for ((i = 0; i < D_COUNT; i++)); do
+      st="$(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")"
+      note="$(meta_get "${D_NAME[$i]}")"
+      line="${D_NAME[$i]} · ${D_TAG[$i]} · $(state_cn "$st")"
+      if [ -n "$note" ]; then line+=" · $note"; fi
+      items+=("$line")
+    done
+    pick "实例管理" "共 ${D_COUNT} 个 · Enter 进入 · q 返回" "${items[@]}" || return 0
+    cmd_instance_actions "$PICK_RESULT"
   done
-  pick "实例管理" "共 ${D_COUNT} 个 · 选择后查看详情" "${items[@]}" || return 0
-  cmd_instance_actions "$PICK_RESULT"
 }
 
 cmd_instance_actions() {
   local idx="$1"
   local n="${D_NAME[$idx]}" k="${D_KIND[$idx]}"
-  local st
-  while :; do
-    st="$(svc_state "$n" "$k")"
-    local -a items=("查看日志" "重启" "停止" "启动" "卸载")
-    if [ "$k" = "proc" ]; then
-      items=("查看命令行" "停止进程" "卸载记录")
+  local st st_cn col dot en note title sub action
+  st="$(svc_state "$n" "$k")"
+  st_cn="$(state_cn "$st")"
+  col="$YELL"; dot="$G_DOT_OFF"
+  case "$st" in
+    active)   col="$GREEN"; dot="$G_DOT" ;;
+    inactive) col="$GRAY" ;;
+    failed)   col="$RED"; dot="$G_ERR" ;;
+  esac
+  en="$(svc_enabled "$n" "$k")"
+  note="$(meta_get "$n")"
+  title="$n  ${col}${dot} ${st_cn}${RESET}"
+  sub="类型 $k · 自启 $en"
+  if [ -n "$note" ]; then sub+=" · 备注 $note"; fi
+  sub+=$'\n'"目录 ${D_DIR[$idx]}"
+  sub+=$'\n'"面板 ${D_EP[$idx]:-—}"
+  sub+=$'\n'"Token $(mask "${D_TK[$idx]:-}")"
+
+  local -a acts=() labels=()
+  if [ "$k" = "proc" ]; then
+    acts+=(cmdline); labels+=("查看命令行")
+    acts+=(stop);    labels+=("停止进程")
+  else
+    acts+=(log);     labels+=("查看日志 · 最近 100 行")
+    acts+=(restart); labels+=("重启服务")
+    if [ "$st" = "active" ]; then
+      acts+=(stop);  labels+=("停止服务")
+    else
+      acts+=(start); labels+=("启动服务")
     fi
-    pick "$n" "类型 $k · 状态 $st · ${D_DIR[$idx]}" "${items[@]}" || return 0
-    if [ "$k" = "proc" ]; then
-      case "$PICK_RESULT" in
-        0) printf '\n  %s\n\n' "$(tr '\0' ' ' < "/proc/${n#pid-}/cmdline" 2>/dev/null)"
-           pause_any ;;
-        1) svc_ctl stop "$n" "$k" && ok "已向 $n 发送 TERM" || warn "操作失败"
-           pause_any ;;
-        2) remove_index "$idx"; return 0 ;;
-      esac
+    if [ "${D_TAG[$idx]}" = "受管" ]; then
+      acts+=(upgrade); labels+=("升级 Agent · 沿用现有参数")
+    fi
+  fi
+  if [ "${D_TAG[$idx]}" != "受管" ] || [ "$k" = "proc" ]; then
+    acts+=(adopt); labels+=("接管为 ka 管理 · 保留 token")
+  fi
+  acts+=(note);      labels+=("设置备注 · 地区 / 用途")
+  acts+=(sep);       labels+=("──")
+  acts+=(uninstall); labels+=("${RED}卸载${RESET}")
+
+  pick "$title" "$sub" "${labels[@]}" || return 0
+  action="${acts[$PICK_RESULT]}"
+
+  case "$action" in
+    cmdline)
+      printf '\n  %s\n\n' "$(tr '\0' ' ' < "/proc/${n#pid-}/cmdline" 2>/dev/null)"
+      pause_any ;;
+    log)
+      printf '\n'
+      if ! svc_logs "$n" "$k" 100; then warn "没有可读日志"; fi
+      pause_any ;;
+    restart) svc_ctl restart "$n" "$k" && ok "已重启 $n" || warn "重启失败" ;;
+    stop)    svc_ctl stop "$n" "$k" && ok "已停止 $n" || warn "停止失败" ;;
+    start)   svc_ctl start "$n" "$k" && ok "已启动 $n" || warn "启动失败" ;;
+    upgrade) cmd_upgrade "$n" ;;
+    adopt)   cmd_adopt "$n" ;;
+    note)    cmd_note "$n" ;;
+    uninstall) remove_index "$idx" ;;
+  esac
+}
+
+cmd_note() {
+  load_conf
+  discover_instances
+  if [ "$D_COUNT" -eq 0 ]; then warn "没有发现实例"; return 0; fi
+  local idx
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    idx="$(find_idx "$1")" || { warn "找不到实例 $1"; return 1; }
+    if [ $# -ge 2 ]; then
+      meta_set "$1" "$2" && ok "备注已保存"
+      return 0
+    fi
+  else
+    local -a items=()
+    local i
+    for ((i = 0; i < D_COUNT; i++)); do
+      items+=("${D_NAME[$i]} · $(meta_get "${D_NAME[$i]}")")
+    done
+    pick "设置备注" "地区 / 用途，留空清除" "${items[@]}" || return 0
+    idx="$PICK_RESULT"
+  fi
+  local name="${D_NAME[$idx]}" old note
+  old="$(meta_get "$name")"
+  ask "备注（当前: ${old:-无}）" "$old" note
+  meta_set "$name" "$note" && ok "$name 备注 → ${note:-（空）}"
+}
+
+cmd_cleanup() {
+  local -a items=("卸载实例 · 停服务并删除目录" "卸载 ka 自身 · 保留实例" "返回")
+  pick "卸载 / 清理" "两件事不一样，别选错" "${items[@]}" || return 0
+  case "$PICK_RESULT" in
+    0) cmd_uninstall ;;
+    1) cmd_self_uninstall ;;
+  esac
+}
+
+cmd_self_uninstall() {
+  need_root
+  warn "将删除 ka 自身：$KA_SELF"
+  dim "同时清理 /usr/local/bin/ka、$KA_CONF、$META_FILE"
+  dim "不会动任何 komari-agent 实例"
+  local go
+  ask "确认? (y/N)" "N" go
+  case "$go" in [Yy]*) ;; *) warn "已取消"; return 0 ;; esac
+
+  rm -f /usr/local/bin/ka 2>/dev/null
+  rm -f "$KA_CONF" 2>/dev/null
+  rm -f "$META_FILE" 2>/dev/null
+  case "$KA_DIR" in
+    /opt/ka|/opt/ka/*) rm -rf "$KA_DIR" ;;
+    *)
+      rm -f "$KA_DIR"/ka "$KA_DIR"/ka.sh 2>/dev/null
+      rm -f "$KA_DIR"/ka-v*.sh 2>/dev/null
+      ;;
+  esac
+  ok "ka 已卸载；实例仍在运行，可随时用面板重新接管"
+}
+
+cmd_batch() {
+  need_root
+  load_conf
+  discover_instances
+  if [ "$D_COUNT" -eq 0 ]; then warn "没有发现实例"; return 0; fi
+  local i total=0
+  for ((i = 0; i < D_COUNT; i++)); do
+    if [ "${D_KIND[$i]}" != "proc" ]; then total=$((total + 1)); fi
+  done
+  if [ "$total" -eq 0 ]; then warn "没有可批量操作的服务实例"; return 0; fi
+  local -a items=("全部重启" "全部停止" "全部启动")
+  pick "批量操作" "对 ${total} 个服务实例执行（不含裸进程）" "${items[@]}" || return 0
+  local act
+  case "$PICK_RESULT" in
+    0) act="restart" ;;
+    1) act="stop" ;;
+    2) act="start" ;;
+  esac
+  local go
+  ask "确认对 ${total} 个服务执行 $act? (y/N)" "N" go
+  case "$go" in [Yy]*) ;; *) warn "已取消"; return 0 ;; esac
+  local okc=0
+  for ((i = 0; i < D_COUNT; i++)); do
+    if [ "${D_KIND[$i]}" = "proc" ]; then continue; fi
+    if svc_ctl "$act" "${D_NAME[$i]}" "${D_KIND[$i]}"; then
+      ok "${D_NAME[$i]} $act"
+      okc=$((okc + 1))
+    else
+      warn "${D_NAME[$i]} $act 失败"
+    fi
+  done
+  blank
+  printf '  %s%d/%d 成功%s\n\n' "$GRAY" "$okc" "$total" "$RESET"
+}
+
+cmd_adopt() {
+  need_root
+  load_conf
+  discover_instances
+  detect_init >/dev/null
+  if [ "$D_COUNT" -eq 0 ]; then warn "没有发现实例"; return 0; fi
+
+  local idx
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    idx="$(find_idx "$1")" || { warn "找不到实例 $1"; return 1; }
+  else
+    local -a items=()
+    local i
+    for ((i = 0; i < D_COUNT; i++)); do
+      items+=("${D_NAME[$i]} · ${D_TAG[$i]} · $(svc_state "${D_NAME[$i]}" "${D_KIND[$i]}")")
+    done
+    pick "接管实例" "把外部 / 进程实例重装成 ka 管理的服务" "${items[@]}" || return 0
+    idx="$PICK_RESULT"
+  fi
+
+  local on="${D_NAME[$idx]}" ok="${D_KIND[$idx]}" odir="${D_DIR[$idx]}"
+  local ep="${D_EP[$idx]:-}" tk="${D_TK[$idx]:-}" raw="${D_ARGS[$idx]:-}"
+
+  if [ -z "$tk" ]; then
+    warn "解析不到 $on 的 token，无法自动接管"
+    dim "可到面板复制该节点 token 后手动重装"
+    return 1
+  fi
+
+  local nn nd n=1
+  if [ "$on" = "$SVC_PREFIX" ]; then
+    nn="$SVC_PREFIX"; nd="$odir"
+  elif ! service_name_taken "$SVC_PREFIX"; then
+    nn="$SVC_PREFIX"; nd="$BASE_DIR"
+  else
+    while [ "$n" -lt 100 ] && service_name_taken "${SVC_PREFIX}-${n}"; do
+      n=$((n + 1))
+    done
+    nn="${SVC_PREFIX}-${n}"; nd="$BASE_DIR/nat$n"
+  fi
+
+  local extra
+  extra="$(filter_args "$raw")"
+
+  blank
+  printf '  %s%s%s %s接管计划%s\n' "$PURP" "$G_BAR" "$RESET" "$B" "$RESET"
+  panel_row "旧服务" "$on（$ok）"
+  panel_row "新服务" "$nn"
+  panel_row "新目录" "$nd"
+  panel_row "面板" "${ep:-—}"
+  panel_row "Token" "$(mask "$tk")"
+  if [ -n "$extra" ]; then panel_row "保留参数" "$extra"; fi
+  blank
+  warn "先停旧服务再重装，期间约 10 秒离线"
+  local go
+  ask "确认接管? (y/N)" "N" go
+  case "$go" in [Yy]*) ;; *) warn "已取消"; return 0 ;; esac
+
+  fetch_installer || die "下载安装脚本失败"
+
+  info "停止旧服务 $on"
+  svc_ctl stop "$on" "$ok" || true
+
+  if reinstall_service "$nd" "$nn" "$ep" "$tk" "$extra"; then
+    enable_start "$nn" "$INIT_SYS"
+    if [ "$on" != "$nn" ]; then
+      purge_service "$on" "$ok"
+      ok "旧服务 $on 已移除"
+      if [ "$odir" != "$nd" ]; then
+        dim "旧目录 $odir 保留未删"
+      fi
+    fi
+    ok "接管完成 → $nn"
+  else
+    err "接管失败，正在回滚"
+    svc_ctl start "$on" "$ok" || true
+    return 1
+  fi
+}
+
+cmd_upgrade() {
+  need_root
+  load_conf
+  discover_instances
+  detect_init >/dev/null
+  if [ "$D_COUNT" -eq 0 ]; then warn "没有发现实例"; return 0; fi
+
+  local -a cand=()
+  local i
+  if [ $# -ge 1 ] && [ -n "$1" ] && [ "$1" != "all" ]; then
+    local one
+    one="$(find_idx "$1")" || { warn "找不到实例 $1"; return 1; }
+    cand=("$one")
+  else
+    for ((i = 0; i < D_COUNT; i++)); do cand+=("$i"); done
+  fi
+
+  local -a todo=()
+  for i in "${cand[@]}"; do
+    if [ "${D_TAG[$i]}" != "受管" ]; then
+      warn "${D_NAME[$i]} 是外部实例，先「接管」再升级"
       continue
     fi
-    case "$PICK_RESULT" in
-      0) printf '\n'
-         if ! svc_logs "$n" "$k" 100; then warn "没有可读的日志（$k）"; fi
-         pause_any ;;
-      1) svc_ctl restart "$n" "$k" && ok "已重启 $n" || warn "重启失败"
-         pause_any ;;
-      2) svc_ctl stop "$n" "$k" && ok "已停止 $n" || warn "停止失败"
-         pause_any ;;
-      3) svc_ctl start "$n" "$k" && ok "已启动 $n" || warn "启动失败"
-         pause_any ;;
-      4) remove_index "$idx"; return 0 ;;
-    esac
+    if [ -z "${D_TK[$i]}" ] || [ -z "${D_EP[$i]}" ]; then
+      warn "${D_NAME[$i]} 缺少面板地址或 token，跳过"
+      continue
+    fi
+    todo+=("$i")
   done
+  if [ "${#todo[@]}" -eq 0 ]; then return 0; fi
+
+  blank
+  for i in "${todo[@]}"; do
+    printf '  %s%s%s %s\n' "$GRAY" "$G_ARROW" "$RESET" "${D_NAME[$i]}"
+  done
+  local go
+  ask "升级以上 ${#todo[@]} 个实例? (y/N)" "N" go
+  case "$go" in [Yy]*) ;; *) warn "已取消"; return 0 ;; esac
+
+  fetch_installer || die "下载安装脚本失败"
+  local okc=0
+  for i in "${todo[@]}"; do
+    local n="${D_NAME[$i]}" k="${D_KIND[$i]}" dir="${D_DIR[$i]}"
+    local ep="${D_EP[$i]}" tk="${D_TK[$i]}" extra
+    extra="$(filter_args "${D_ARGS[$i]:-}")"
+    info "升级 $n"
+    svc_ctl stop "$n" "$k" || true
+    if reinstall_service "$dir" "$n" "$ep" "$tk" "$extra"; then
+      enable_start "$n" "$k"
+      ok "$n 已升级"
+      okc=$((okc + 1))
+    else
+      err "$n 升级失败，尝试恢复"
+      svc_ctl start "$n" "$k" || true
+    fi
+  done
+  blank
+  printf '  %s%d/%d 成功%s\n\n' "$GRAY" "$okc" "${#todo[@]}" "$RESET"
 }
 
 cmd_logs() {
@@ -1300,7 +1803,13 @@ cmd_version() {
   panel_row "发布目录" "$KA_DIR"
   panel_row "配置文件" "$KA_CONF"
   panel_row "初始化"   "$(init_label "$(detect_init)")"
-  panel_row "版本规则" "$KA_BUMP_STYLE（minor: +0.1）"
+  local style_text
+  if [ "$KA_BUMP_STYLE" = "patch" ]; then
+    style_text="patch（每次 +0.0.1）"
+  else
+    style_text="minor（每次 +0.1）"
+  fi
+  panel_row "版本规则" "$style_text"
   blank
   printf '  %s%s%s %s归档版本%s\n' "$PURP" "$G_BAR" "$RESET" "$B" "$RESET"
   rule 52
@@ -1310,7 +1819,10 @@ cmd_version() {
     printf '   %s%s%s %s\n' "$GRAY" "$G_ARROW" "$RESET" "$(basename "$f")"
     found=1
   done
-  [ "$found" -eq 0 ] && dim "（无）"
+  if [ "$found" -eq 0 ]; then
+    dim "（无）"
+    dim "提示：当前 ka 像是手动拷贝的，运行 ka self-install 可启用版本归档"
+  fi
   blank
 }
 
@@ -1323,9 +1835,16 @@ cmd_help() {
 
   ${B}管理${RESET}
     ka status             实例状态（systemd / OpenRC 都认）
-    ka doctor             一键自检（服务 + 面板连通）
+    ka doctor             一键自检（服务 / 自启 / 面板连通）
+    ka adopt [名字]       接管外部实例（保留 token，重装为 ka 管理）
+    ka upgrade [all|名字]  原地升级 Agent（沿用现有参数）
+    ka batch              批量重启 / 停止 / 启动
+    ka note [名字] [备注]  设置实例备注（地区/用途）
     ka logs <n|name|all>  查看日志，默认 80 行
-    ka uninstall          卸载实例
+
+  ${B}清理${RESET}
+    ka uninstall          卸载实例（停服务 + 删目录）
+    ka self-uninstall     卸载 ka 自身（保留实例）
 
   ${B}版本${RESET}
     ka version            版本与归档信息
@@ -1350,20 +1869,20 @@ cmd_menu() {
   while :; do
     discover_instances
     detect_init >/dev/null
-    case "$D_COUNT" in
-      0) sub="未发现已安装实例（$(init_label "$INIT_SYS")）" ;;
-      1) sub="已发现 1 个已安装实例（$(init_label "$INIT_SYS")）" ;;
-      *) sub="已发现 ${D_COUNT} 个已安装实例（$(init_label "$INIT_SYS")）" ;;
-    esac
-    items=("安装 / 新增实例" "实例管理" "自检 / 诊断" "版本信息" "退出")
-    if [ "$D_COUNT" -gt 0 ]; then PICK_START=1; fi
+    if [ "$D_COUNT" -eq 0 ]; then
+      sub="v$KA_VERSION · $(init_label "$INIT_SYS") · 未发现实例"
+    else
+      sub="v$KA_VERSION · $(init_label "$INIT_SYS") · 已发现 ${D_COUNT} 个实例"
+    fi
+    items=("安装 / 新增实例" "实例管理" "批量操作" "自检" "卸载 / 清理" "退出")
     pick "主菜单" "$sub" "${items[@]}" || return 0
     case "$PICK_RESULT" in
       0) cmd_wizard; pause_any ;;
       1) cmd_instances; pause_any ;;
-      2) cmd_doctor; pause_any ;;
-      3) cmd_version; pause_any ;;
-      4) return 0 ;;
+      2) cmd_batch; pause_any ;;
+      3) cmd_doctor; pause_any ;;
+      4) cmd_cleanup; pause_any ;;
+      5) return 0 ;;
     esac
   done
 }
@@ -1377,8 +1896,14 @@ main() {
     wizard|install)       cmd_wizard ;;
     status)               cmd_status ;;
     doctor|check)         cmd_doctor ;;
+    adopt)                cmd_adopt "$@" ;;
+    upgrade)              cmd_upgrade "$@" ;;
+    batch)                cmd_batch ;;
+    note)                 cmd_note "$@" ;;
     logs)                 cmd_logs "$@" ;;
     uninstall|remove)     cmd_uninstall ;;
+    cleanup)              cmd_cleanup ;;
+    self-uninstall)       cmd_self_uninstall ;;
     version|-v|--version) cmd_version ;;
     bump)                 cmd_bump ;;
     self-install)         cmd_self_install "$@" ;;
