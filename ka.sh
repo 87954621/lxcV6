@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.0.5        归档文件: ka-v<版本>.sh
+#  版本: 0.0.6        归档文件: ka-v<版本>.sh
 #  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
@@ -22,7 +22,7 @@
 
 set -u
 
-KA_VERSION="0.0.5"
+KA_VERSION="0.0.6"
 KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
@@ -265,6 +265,127 @@ draw_header() {
 }
 
 is_sep() { [ "${1:-}" = "──" ]; }
+
+detect_nics() {
+  local p
+  if [ -d /sys/class/net ]; then
+    for p in /sys/class/net/*; do
+      [ -e "$p" ] && basename "$p"
+    done
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip -o link 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//'
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig -a 2>/dev/null | awk '/^[a-zA-Z0-9]/ {print $1}' | tr -d ':'
+  fi
+}
+
+detect_mounts() {
+  [ -r /proc/mounts ] || return 0
+  awk '$2 !~ /^\/(proc|sys|dev|run)(\/|$)/ {print $2}' /proc/mounts 2>/dev/null \
+    | awk '!seen[$0]++' | sort
+}
+
+pick_multi() { # 标题 副标题 分隔符 变量名 候选项...
+  local title="$1" sub="$2" sep="$3" var="$4"
+  shift 4
+  local -a opts=("$@")
+  local cur="${!var}" x c i found
+
+  # 当前值拆开（用 read -a，避免路径被 glob 展开）
+  local IFS_OLD="$IFS"
+  local -a sel=()
+  IFS="$sep" read -r -a sel <<< "$cur"
+  IFS="$IFS_OLD"
+
+  # 已配置但不在候选里的值也补进来
+  for x in ${sel[@]+"${sel[@]}"}; do
+    [ -n "$x" ] || continue
+    found=0
+    for c in ${opts[@]+"${opts[@]}"}; do
+      if [ "$c" = "$x" ]; then found=1; break; fi
+    done
+    if [ "$found" -eq 0 ]; then opts+=("$x"); fi
+  done
+
+  local -a checked=()
+  for ((i = 0; i < ${#opts[@]}; i++)); do
+    checked+=(0)
+    for x in ${sel[@]+"${sel[@]}"}; do
+      if [ "$x" = "${opts[$i]}" ]; then checked[$i]=1; fi
+    done
+  done
+
+  local n="${#opts[@]}" total=$((n + 2)) sel_i=0
+  hide_cursor
+  while :; do
+    screen_home
+    draw_header "$title" "$sub"
+    for ((i = 0; i < n; i++)); do
+      local mark
+      if [ "${checked[$i]}" -eq 1 ]; then mark="${GREEN}[x]${RESET}"; else mark="${GRAY}[ ]${RESET}"; fi
+      if [ "$i" -eq "$sel_i" ]; then
+        printf '   %s❯%s %s %s\n' "$PINK" "$RESET" "$mark" "${opts[$i]}"
+      else
+        printf '     %s %s\n' "$mark" "${opts[$i]}"
+      fi
+    done
+    printf '     %s──────%s\n' "$DIM" "$RESET"
+    if [ "$sel_i" -eq "$n" ]; then
+      printf '   %s❯%s %s\n' "$PINK" "$RESET" "手动输入…"
+    else
+      printf '     %s\n' "手动输入…"
+    fi
+    if [ "$sel_i" -eq $((n + 1)) ]; then
+      printf '   %s❯%s %s\n' "$PINK" "$RESET" "${GREEN}完成${RESET}"
+    else
+      printf '     %s\n' "完成"
+    fi
+    printf '\n   %s空格/回车 勾选 · q 取消%s\n' "$GRAY" "$RESET"
+    if ! read_key; then break; fi
+    case "$KEY" in
+      UP)   sel_i=$(((sel_i + total - 1) % total)) ;;
+      DOWN) sel_i=$(((sel_i + 1) % total)) ;;
+      QUIT|ESC) show_cursor; return 1 ;;
+      ENTER|SPACE)
+        if [ "$sel_i" -lt "$n" ]; then
+          if [ "${checked[$sel_i]}" -eq 1 ]; then checked[$sel_i]=0; else checked[$sel_i]=1; fi
+        elif [ "$sel_i" -eq "$n" ]; then
+          show_cursor
+          screen_home
+          draw_header "$title" "手动追加（多个用 $sep 分隔，回车返回）"
+          local add
+          ask "追加" "" add
+          if [ -n "$add" ]; then
+            local -a adds=()
+            IFS="$sep" read -r -a adds <<< "$add"
+            IFS="$IFS_OLD"
+            for x in ${adds[@]+"${adds[@]}"}; do
+              [ -n "$x" ] || continue
+              opts+=("$x"); checked+=("1")
+            done
+            n="${#opts[@]}"; total=$((n + 2))
+            sel_i=$((n + 1))
+          fi
+          hide_cursor
+        else
+          break
+        fi ;;
+    esac
+  done
+  show_cursor
+
+  local out=""
+  for ((i = 0; i < n; i++)); do
+    if [ "${checked[$i]}" -eq 1 ]; then
+      if [ -n "$out" ]; then out+="$sep"; fi
+      out+="${opts[$i]}"
+    fi
+  done
+  printf -v "$var" '%s' "$out"
+  return 0
+}
 
 pick() {
   local title="$1" sub="$2"
@@ -1085,11 +1206,25 @@ adv_draw2() {
   cfg_row 7 "$s" "返回"         "${GREEN}←${RESET}"
 }
 
+multi_nics() {
+  local title="$1" sub="$2" var="$3" x
+  local -a c=()
+  while IFS= read -r x; do [ -n "$x" ] && c+=("$x"); done <<< "$(detect_nics)"
+  pick_multi "$title" "$sub" "," "$var" ${c[@]+"${c[@]}"}
+}
+
+multi_mounts() {
+  local x
+  local -a c=()
+  while IFS= read -r x; do [ -n "$x" ] && c+=("$x"); done <<< "$(detect_mounts)"
+  pick_multi "包含挂载点" "勾选要统计的挂载点；全不选=全部" ";" MOUNT_POINTS ${c[@]+"${c[@]}"}
+}
+
 adv_edit2() {
   case "$1" in
-    0) edit_str "包含网卡（逗号分隔，空=全部）" INCLUDE_NICS ;;
-    1) edit_str "排除网卡（逗号分隔，空=不排除）" EXCLUDE_NICS ;;
-    2) edit_str "包含挂载点（分号分隔，空=全部）" MOUNT_POINTS ;;
+    0) multi_nics "包含网卡" "勾选要统计的网卡；全不选=全部" INCLUDE_NICS ;;
+    1) multi_nics "排除网卡" "勾选要排除的网卡" EXCLUDE_NICS ;;
+    2) multi_mounts ;;
     3) edit_int "月重置日（1-31，0=关闭）" MONTH_ROTATE 0 31 ;;
     4) edit_str "安装版本（如 1.2.13 / snapshot，空=latest）" INSTALL_VERSION ;;
     5) edit_str "GitHub 代理（如 https://ghproxy.net，空=直连）" GH_PROXY ;;
