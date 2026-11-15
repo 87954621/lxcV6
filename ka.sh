@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ka  ·  Komari Agent 部署器
-#  版本: 0.0.8        归档文件: ka-v<版本>.sh
+#  版本: 0.0.10        归档文件: ka-v<版本>.sh
 #  版本规则: 每次修改 +0.0.1（0.0.1 → 0.0.2 → 0.0.3），旧文件全部保留
 #
 #  用法:
@@ -22,7 +22,7 @@
 
 set -u
 
-KA_VERSION="0.0.8"
+KA_VERSION="0.0.10"
 KA_BUMP_STYLE="patch"
 KA_INSTALLER="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KA_CONF="${KA_CONF:-/etc/ka.conf}"
@@ -512,7 +512,8 @@ INTERVAL="1.0"
 INFO_INTERVAL="5"
 DISABLE_WEBSSH=0
 DISABLE_AUTOUPDATE=0
-MEM_AVAILABLE=0
+MEM_CACHE=0
+GET_IP_NIC=0
 INSECURE=0
 INCLUDE_NICS=""
 EXCLUDE_NICS=""
@@ -542,7 +543,8 @@ load_conf() {
   INFO_INTERVAL="${KA_INFO_INTERVAL:-$INFO_INTERVAL}"
   DISABLE_WEBSSH="${KA_WEBSSH:-$DISABLE_WEBSSH}"
   DISABLE_AUTOUPDATE="${KA_AUTOUPDATE:-$DISABLE_AUTOUPDATE}"
-  MEM_AVAILABLE="${KA_MEMAVAIL:-$MEM_AVAILABLE}"
+  MEM_CACHE="${KA_MEMCACHE:-$MEM_CACHE}"
+  GET_IP_NIC="${KA_GETIP:-$GET_IP_NIC}"
   INSECURE="${KA_INSECURE:-$INSECURE}"
   INCLUDE_NICS="${KA_INCLUDE_NICS:-$INCLUDE_NICS}"
   EXCLUDE_NICS="${KA_EXCLUDE_NICS:-$EXCLUDE_NICS}"
@@ -569,7 +571,8 @@ KA_INTERVAL='$INTERVAL'
 KA_INFO_INTERVAL='$INFO_INTERVAL'
 KA_WEBSSH='$DISABLE_WEBSSH'
 KA_AUTOUPDATE='$DISABLE_AUTOUPDATE'
-KA_MEMAVAIL='$MEM_AVAILABLE'
+KA_MEMCACHE='$MEM_CACHE'
+KA_GETIP='$GET_IP_NIC'
 KA_INSECURE='$INSECURE'
 KA_INCLUDE_NICS='$INCLUDE_NICS'
 KA_EXCLUDE_NICS='$EXCLUDE_NICS'
@@ -692,7 +695,8 @@ build_args() {
   ARGS=(-e "$ENDPOINT" -i "$INTERVAL" --info-report-interval "$INFO_INTERVAL")
   [ "$DISABLE_WEBSSH" -eq 1 ]     && ARGS+=(--disable-web-ssh)
   [ "$DISABLE_AUTOUPDATE" -eq 1 ] && ARGS+=(--disable-auto-update)
-  [ "$MEM_AVAILABLE" -eq 1 ]      && ARGS+=(--memory-mode-available)
+  [ "$MEM_CACHE" -eq 1 ]          && ARGS+=(--memory-include-cache)
+  [ "$GET_IP_NIC" -eq 1 ]         && ARGS+=(--get-ip-addr-from-nic)
   [ "$INSECURE" -eq 1 ]           && ARGS+=(-u)
   [ "$GPU_MONITOR" -eq 1 ]        && ARGS+=(--gpu)
   [ -n "$INCLUDE_NICS" ]          && ARGS+=(--include-nics "$INCLUDE_NICS")
@@ -1062,15 +1066,37 @@ purge_service() { # 名字 类型：只删服务定义，不动目录
 
 remove_index() { # 下标 [force]
   local idx="$1" force="${2:-0}"
-  local n="${D_NAME[$idx]}" k="${D_KIND[$idx]}" dir="${D_DIR[$idx]}" go ok_dir
+  local n="${D_NAME[$idx]}" k="${D_KIND[$idx]}" dir="${D_DIR[$idx]}"
+  local go ok_dir=0 j shared=0
+
+  # 目录是否被其它实例共用：单实例装在 /opt/komari，
+  # 多开实例在 /opt/komari/natN，删父目录会把别人一起清掉
+  for ((j = 0; j < D_COUNT; j++)); do
+    [ "$j" -eq "$idx" ] && continue
+    case "${D_DIR[$j]}" in
+      "$dir"|"$dir"/*) shared=1; break ;;
+    esac
+  done
+
   if [ "$force" -eq 0 ]; then
-    warn "将停止并删除 $n（$k），目录 $dir"
+    warn "将停止并删除 $n（$k）"
+    dim "目录 $dir"
+    if [ "$shared" -eq 1 ]; then
+      warn "该目录下还有其它实例，目录会保留，只删这个服务"
+      for ((j = 0; j < D_COUNT; j++)); do
+        [ "$j" -eq "$idx" ] && continue
+        case "${D_DIR[$j]}" in
+          "$dir"|"$dir"/*) dim "  · ${D_NAME[$j]}  ${D_DIR[$j]}" ;;
+        esac
+      done
+    fi
     ask "确认? (y/N)" "N" go
     case "$go" in
       [Yy]*) ;;
       *) warn "已跳过"; return 0 ;;
     esac
   fi
+
   case "$k" in
     systemd)
       systemctl disable --now "$n" >/dev/null 2>&1 || true
@@ -1083,7 +1109,7 @@ remove_index() { # 下标 [force]
     proc)
       kill "${n#pid-}" >/dev/null 2>&1 || true ;;
   esac
-  ok_dir=0
+
   case "$dir" in
     /opt/komari*|/opt/ka*) ok_dir=1 ;;
   esac
@@ -1092,9 +1118,13 @@ remove_index() { # 下标 [force]
       "$BASE_DIR"|"${BASE_DIR%/}"/*) ok_dir=1 ;;
     esac
   fi
-  if [ "$ok_dir" -eq 1 ] && [ "$k" != "proc" ]; then
+
+  if [ "$ok_dir" -eq 1 ] && [ "$k" != "proc" ] && [ "$shared" -eq 0 ]; then
     rm -rf "$dir"
     ok "$n 已卸载，目录 $dir 已删除"
+  elif [ "$shared" -eq 1 ]; then
+    ok "$n 已卸载"
+    warn "目录 $dir 仍被其它实例使用，已保留"
   else
     ok "$n 已卸载"
   fi
@@ -1227,9 +1257,11 @@ adv_draw1() {
   cfg_row 2 "$s" "禁用远程控制"   "$(toggle_render "$DISABLE_WEBSSH")"
   cfg_row 3 "$s" "禁用自动更新"   "$(toggle_render "$DISABLE_AUTOUPDATE")"
   cfg_row 4 "$s" "忽略不安全证书" "$(toggle_render "$INSECURE")"
-  cfg_row 5 "$s" "详细 GPU 监控"  "$(toggle_render "$GPU_MONITOR")"
-  cfg_row 6 "$s" "更多设置"       "${GRAY}网络 / 磁盘 / 安装 →${RESET}"
-  cfg_row 7 "$s" "完成并继续"     "${GREEN}→${RESET}"
+  cfg_row 5 "$s" "包含缓冲区内存" "$(toggle_render "$MEM_CACHE")"
+  cfg_row 6 "$s" "从网卡获取 IP"  "$(toggle_render "$GET_IP_NIC")"
+  cfg_row 7 "$s" "详细 GPU 监控"  "$(toggle_render "$GPU_MONITOR")"
+  cfg_row 8 "$s" "更多设置"       "${GRAY}网络 / 磁盘 / 安装 →${RESET}"
+  cfg_row 9 "$s" "完成并继续"     "${GREEN}→${RESET}"
 }
 
 adv_edit1() {
@@ -1239,9 +1271,11 @@ adv_edit1() {
     2) [ "$DISABLE_WEBSSH" -eq 1 ] && DISABLE_WEBSSH=0 || DISABLE_WEBSSH=1 ;;
     3) [ "$DISABLE_AUTOUPDATE" -eq 1 ] && DISABLE_AUTOUPDATE=0 || DISABLE_AUTOUPDATE=1 ;;
     4) [ "$INSECURE" -eq 1 ] && INSECURE=0 || INSECURE=1 ;;
-    5) [ "$GPU_MONITOR" -eq 1 ] && GPU_MONITOR=0 || GPU_MONITOR=1 ;;
-    6) adv_run "更多设置" "网卡 / 挂载点 / 安装项" "$ADV_MORE_DRAW" "$ADV_MORE_EDIT" "$ADV_MORE_N" ;;
-    7) return 1 ;;
+    5) [ "$MEM_CACHE" -eq 1 ] && MEM_CACHE=0 || MEM_CACHE=1 ;;
+    6) [ "$GET_IP_NIC" -eq 1 ] && GET_IP_NIC=0 || GET_IP_NIC=1 ;;
+    7) [ "$GPU_MONITOR" -eq 1 ] && GPU_MONITOR=0 || GPU_MONITOR=1 ;;
+    8) adv_run "更多设置" "网卡 / 挂载点 / 安装项" "$ADV_MORE_DRAW" "$ADV_MORE_EDIT" "$ADV_MORE_N" ;;
+    9) return 1 ;;
   esac
   return 0
 }
@@ -1315,7 +1349,7 @@ step_advanced() {
     step_advanced_plain
     return 0
   fi
-  adv_run "高级参数" "默认值够用，Esc 或「完成」继续" adv_draw1 adv_edit1 8
+  adv_run "高级参数" "默认值够用，Esc 或「完成」继续" adv_draw1 adv_edit1 10
 }
 
 step_advanced_plain() {
@@ -1337,6 +1371,8 @@ step_advanced_plain() {
   printf '   %s13%s  安装目录        %s\n' "$CYAN" "$RESET" "$BASE_DIR"
   printf '   %s14%s  服务名前缀      %s\n' "$CYAN" "$RESET" "$SVC_PREFIX"
   printf '   %s15%s  额外参数        %s\n' "$CYAN" "$RESET" "${EXTRA_AGENT:-无}"
+  printf '   %s16%s  包含缓冲区内存  %s\n' "$CYAN" "$RESET" "$(toggle_render "$MEM_CACHE")"
+  printf '   %s17%s  从网卡获取 IP   %s\n' "$CYAN" "$RESET" "$(toggle_render "$GET_IP_NIC")"
   blank
   while :; do
     ask "编号（回车继续）" "" ch
@@ -1357,6 +1393,8 @@ step_advanced_plain() {
       13) ask "安装目录" "$BASE_DIR" BASE_DIR ;;
       14) ask "服务名前缀" "$SVC_PREFIX" SVC_PREFIX ;;
       15) ask "额外参数" "$EXTRA_AGENT" v; [ "$v" = "-" ] && v=""; EXTRA_AGENT="$v" ;;
+      16) [ "$MEM_CACHE" -eq 1 ] && MEM_CACHE=0 || MEM_CACHE=1 ;;
+      17) [ "$GET_IP_NIC" -eq 1 ] && GET_IP_NIC=0 || GET_IP_NIC=1 ;;
       *) warn "没有 $ch 这个编号" ;;
     esac
     ok "已更新"
@@ -1742,7 +1780,8 @@ reset_settings() {
   INFO_INTERVAL="5"
   DISABLE_WEBSSH=0
   DISABLE_AUTOUPDATE=0
-  MEM_AVAILABLE=0
+  MEM_CACHE=0
+  GET_IP_NIC=0
   INSECURE=0
   GPU_MONITOR=0
   INCLUDE_NICS=""
@@ -1770,7 +1809,9 @@ load_settings_from_args() {
       --disable-auto-update)    DISABLE_AUTOUPDATE=1 ;;
       -u|--ignore-unsafe-cert)  INSECURE=1 ;;
       --gpu)                    GPU_MONITOR=1 ;;
-      --memory-mode-available)  MEM_AVAILABLE=1 ;;
+      --memory-include-cache)   MEM_CACHE=1 ;;
+      --get-ip-addr-from-nic)   GET_IP_NIC=1 ;;
+      --memory-mode-available)  : ;;
       *) EXTRA_AGENT="${EXTRA_AGENT:+$EXTRA_AGENT }$a" ;;
     esac
   done
@@ -1796,7 +1837,7 @@ cmd_edit_params() {
   ADV_MORE_EDIT="inst_edit2"
   ADV_MORE_N=6
   if [ "$UI_TUI" -eq 1 ]; then
-    adv_run "修改参数" "$n · Esc 取消" adv_draw1 adv_edit1 8
+    adv_run "修改参数" "$n · Esc 取消" adv_draw1 adv_edit1 10
   else
     step_advanced_plain
   fi
