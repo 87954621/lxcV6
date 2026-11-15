@@ -1,5 +1,5 @@
 #!/bin/sh
-# fip-v4.7.sh — 宿主机假网卡 + 按国家加地址（Cloudflare CSV）
+# fip-v5.0.sh — 宿主机假网卡 + 按国家加地址（Cloudflare CSV）
 #
 # 一个「加地址」入口，三种来源：
 #   1. 内置（朝鲜：2606:54c1:1:c4::/64、175.45.176.0/22、4 个 /32）
@@ -12,7 +12,7 @@
 # noprefixroute 的作用：地址照样显示，但不生成「这个网段在这张卡上」的直连路由，
 # 避免把去往真实 IP（比如 Cloudflare 的段）的流量带进黑洞。
 #
-# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v4.7.sh → fip-v4.8.sh）。
+# 版本规则：每次改动 +0.1，新建文件，旧版本保留（fip-v5.0.sh → fip-v5.1.sh）。
 #
 # 用法：
 #   fip                    菜单
@@ -44,7 +44,7 @@
 #   FIP_COLOR=0                  关颜色
 set -u
 
-VERSION="4.7"
+VERSION="5.0"
 
 DEV="${FIP_DEV:-fip0}"
 DEV_TYPE="${FIP_TYPE:-dummy}"
@@ -414,6 +414,22 @@ norm_prefix() {
   printf '%s' "$_p"
 }
 
+# 段 → 网关地址（v6: 前缀::1；v4: 网络+1）
+gw_of() {
+  case "$1" in
+    *:*) _p="${1%%/*}"; _l="${1##*/}"
+         case "$_l" in ''|*[!0-9]*) _l=64 ;; esac
+         [ "$_l" -ge 128 ] && { printf '%s\n' "$1"; return 0; }
+         while [ "${_p%:}" != "$_p" ]; do _p="${_p%:}"; done
+         printf '%s::1/%s\n' "$_p" "$_l" ;;
+    */*) _b="${1%%/*}"; _l="${1##*/}"
+         case "$_l" in ''|*[!0-9]*) _l=24 ;; esac
+         [ "$_l" -ge 32 ] && { printf '%s\n' "$1"; return 0; }
+         printf '%s/%s\n' "$(int2ip "$(( $(ip2int "$_b") + 1 ))")" "$_l" ;;
+    *)   printf '%s\n' "$1" ;;
+  esac
+}
+
 valid_prefix() {
   case "$1" in ''|*[!0-9a-fA-F:.]*) return 1 ;; esac
   case "$1" in *:*:*) ;; *) return 1 ;; esac
@@ -615,7 +631,7 @@ random_v6_in() {
 }
 
 gen_v6_128() {
-  _p="$(norm_prefix "$PREFIX")"
+  _p="$(norm_prefix "${1:-$PREFIX}")"
   _n=1; _s="$_p"
   while :; do
     case "$_s" in *:*) _s="${_s#*:}"; _n=$(( _n + 1 )) ;; *) break ;; esac
@@ -625,7 +641,8 @@ gen_v6_128() {
 }
 
 gen_v4_32() {
-  _base="${V4_NET%%/*}"; _len="${V4_NET##*/}"
+  _net="${1:-$V4_NET}"
+  _base="${_net%%/*}"; _len="${_net##*/}"
   case "$_len" in ''|*[!0-9]*) _len=22 ;; esac
   _size=$(( 1 << (32 - _len) ))
   [ "$_size" -gt 65536 ] && _size=65536
@@ -998,16 +1015,24 @@ cmd_country_list() {
 
 # 选设备：fip0 或 fip1
 choose_dev() {
-  case "$DEV" in
-    *0) _new="${DEV%0}1" ;;
-    *)  _new="${DEV}1" ;;
-  esac
-  printf '   %s1%s  %s（现有设备）\n' "$BOLD_W" "$RST" "$DEV"
-  if dev_exists "$_new"; then
-    printf '   %s2%s  %s（已存在，复用）\n' "$BOLD_W" "$RST" "$_new"
+  # 自动找第一个空闲的 fipN
+  _new=""
+  _i=1
+  while [ "$_i" -le 99 ]; do
+    case "$DEV" in
+      *0) _cand="${DEV%0}${_i}" ;;
+      *)  _cand="${DEV}${_i}" ;;
+    esac
+    if ! dev_exists "$_cand"; then _new="$_cand"; break; fi
+    _i=$(( _i + 1 ))
+  done
+  [ -n "$_new" ] || _new="${DEV}1"
+  if dev_exists "$DEV"; then
+    printf '   %s1%s  %s（现有设备）\n' "$BOLD_W" "$RST" "$DEV"
   else
-    printf '   %s2%s  新建 %s（%s）\n' "$BOLD_W" "$RST" "$_new" "$DEV_TYPE"
+    printf '   %s1%s  %s（不存在，会新建）\n' "$BOLD_W" "$RST" "$DEV"
   fi
+  printf '   %s2%s  新建（自动用 %s）\n' "$BOLD_W" "$RST" "$_new"
   echo
   readline "加到哪 [1/2，回车=1]：" "1"
   case "$UI_IN" in
@@ -1072,6 +1097,7 @@ ui_builtin() {
   fi
   echo
   choose_dev || return 1
+  [ "$_form" = "seg" ] && _sel="$(gw_of "$_sel")"
   apply_list "$_sel" "$_form"
 }
 
@@ -1161,21 +1187,26 @@ ui_manual() {
 
 ui_gen() {
   hr "生成地址"
-  item "1" "/128（${PREFIX}::/64）"
-  item "2" "/32（${V4_NET}）"
+  item "1" "/128（前缀 ${PREFIX}，可改）"
+  item "2" "/32（段 ${V4_NET}，可改）"
   echo
   readline "选择 [1-2]，回车取消：" ""
   case "$UI_IN" in
-    1) echo; kvp "地址" "$(gen_v6_128)" ;;
-    2) echo; kvp "地址" "$(gen_v4_32)" ;;
+    1)
+      readline "前缀（回车=${PREFIX}）：" "$PREFIX"
+      echo; kvp "地址" "$(gen_v6_128 "$UI_IN")" ;;
+    2)
+      readline "段（回车=${V4_NET}）：" "$V4_NET"
+      echo; kvp "地址" "$(gen_v4_32 "$UI_IN")" ;;
     *) dim "已取消" ;;
   esac
 }
 
 ui_help() {
   hr "速查"
-  item "fip v6 [前缀]" "建 IPv6 网桥，加 <前缀>::1/64"
-  item "fip v4 [段]"   "建 IPv4 网桥，加段的 .1"
+  item "fip add 2606:...::1/64" "建卡 + 加地址（不存在会自动建）"
+  item "fip v6 [前缀]" "只建 IPv6 网桥（命令行）"
+  item "fip v4 [段]"   "只建 IPv4 网桥（命令行）"
   item "fip add <地址/段>" "手动加"
   item "fip add --builtin --one|--seg" "内置取一个"
   item "fip add --country US --one|--seg" "国家取一个"
@@ -1401,48 +1432,33 @@ cmd_menu() {
       printf '   %s┃%s %s◈%s 设备 %s（未建）\n' "$BORD" "$RST" "$SKY_B" "$RST" "$DEV"
     fi
     echo
-    item "1" "建网桥（$DEV）"
-    item "2" "加地址（内置 / 国家 / 手动）"
-    echo
-    item "3" "查看状态"
-    item "4" "生成地址（/128 或 /32）"
-    item "5" "删除（地址 / 设备）"
-    item "6" "保存 / 开机恢复"
-    item "7" "操作日志"
-    item "8" "数据更新（CSV 缓存）"
-    item "9" "帮助"
+    item "1" "加地址（内置 / 国家 / 手动）"
+    item "2" "查看状态"
+    item "3" "生成地址（/128 或 /32）"
+    item "4" "删除（地址 / 设备）"
+    item "5" "保存 / 开机恢复"
+    item "6" "操作日志"
+    item "7" "数据更新（CSV 缓存）"
+    item "8" "帮助"
     item "0" "退出"
     echo
-    printf '  %s❯%s %s请选择%s %s[0-9]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
+    printf '  %s❯%s %s请选择%s %s[0-8]%s %s:%s ' "$PINK_B" "$RST" "$BOLD_W" "$RST" "$TEAL_B" "$RST" "$GRA" "$RST"
     read -r c || return 0
     case "$c" in
-      1) ui_v6or4; pause ;;
-      2) ui_add; pause ;;
-      3) cmd_status; pause ;;
-      4) ui_gen; pause ;;
-      5) ui_del; pause ;;
-      6) ui_save; pause ;;
-      7) ui_log; pause ;;
-      8) ui_data; pause ;;
-      9) ui_help; pause ;;
+      1) ui_add; pause ;;
+      2) cmd_status; pause ;;
+      3) ui_gen; pause ;;
+      4) ui_del; pause ;;
+      5) ui_save; pause ;;
+      6) ui_log; pause ;;
+      7) ui_data; pause ;;
+      8) ui_help; pause ;;
       0) printf '\n  %s再见 👋%s\n\n' "$TEAL_B" "$RST"; exit 0 ;;
       *) printf '  %s✘ 无效选项%s\n' "$BRED" "$RST"; pause ;;
     esac
   done
 }
 
-ui_v6or4() {
-  hr "建网桥"
-  item "1" "IPv6（${PREFIX}::/64）"
-  item "2" "IPv4（${V4_NET}）"
-  echo
-  readline "选择 [1-2]，回车取消：" ""
-  case "$UI_IN" in
-    1) echo; cmd_v6 ;;
-    2) echo; cmd_v4 ;;
-    *) dim "已取消" ;;
-  esac
-}
 
 ui_del() {
   hr "删除"
@@ -1505,7 +1521,7 @@ cmd_add() {
         _pick="$(printf '%s\n' "$BUILTIN_V6" "$BUILTIN_V4" $BUILTIN_32 | rand_line)"
         apply_list "$_pick" one
       else
-        apply_list "$BUILTIN_V6 $BUILTIN_V4" seg
+        apply_list "$(gw_of "$BUILTIN_V6") $(gw_of "$BUILTIN_V4")" seg
       fi
       ;;
     country)
@@ -1553,7 +1569,8 @@ usage() {
   fip boot-install        安装开机自动恢复
   fip boot-remove         卸载开机自动恢复
   fip log [status|tail [n]|clear]   操作日志
-  fip gen6 / gen4         生成 /128 或 /32
+  fip gen6 [前缀]         生成 /128（默认 2606:54c1:1:c4）
+  fip gen4 [段]           生成 /32（默认 175.45.176.0/22）
   fip help / version
 
 规则：
@@ -1582,7 +1599,7 @@ usage() {
   FIP_MENU=0                   无参数不进菜单
 
 安装：
-  install -m 755 fip-v4.7.sh /usr/local/bin/fip
+  install -m 755 fip-v5.0.sh /usr/local/bin/fip
 EOF
 }
 
